@@ -142,7 +142,7 @@ def predict_cj_with_isentrope(
     iso_v_ratios = jnp.linspace(V_cj/V0, 8.0, n_isentrope_points)
     _, iso_data = jax.lax.scan(scan_isentrope, None, iso_v_ratios)
     
-    return D_cj, P_cj, T_cj, V_cj, iso_data[0], iso_data[1]
+    return D_cj, P_cj, T_cj, V_cj, iso_data[0], iso_data[1], n_cj
 
 
 # Simplified wrapper for backward compatibility
