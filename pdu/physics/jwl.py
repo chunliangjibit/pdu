@@ -22,6 +22,7 @@ class JWLParams:
     R2: float
     omega: float
     E0: float # GPa (Energy density per unit volume initial)
+    fit_mse: float = 0.0 # 对数域拟合均方误差
 
 def jwl_pressure(V_rel, A, B, R1, R2, omega, E_per_vol):
     """JWL Pressure Equation (Principal Isentrope assumption E(V))
@@ -50,11 +51,11 @@ def jwl_pressure(V_rel, A, B, R1, R2, omega, E_per_vol):
     # Usually we fit this P_s form.
     pass
 
-def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory):
+def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory, exp_priors=None):
     """
-    V8.1: Robust Log-Space Fitting with Gamma-CJ Anchoring
+    V8.5: Prior-Aware Robust Fitting
     
-    采用对数域损失函数均衡高低压误差，并增加绝热指数 (Gamma) 锚定以保证 CJ 点能量导数连续性。
+    增加文献先验约束，平衡数学解的冗余性，优先寻找靠近标准 Basin 的物理参数。
     """
     from scipy.optimize import minimize
     import numpy as np
@@ -64,7 +65,6 @@ def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory):
     P_cj = P_array[0]
     
     # 2. 计算物理目标 Gamma (绝热指数)
-    # Gamma_CJ ≈ (rho0 * D^2) / P_CJ - 1
     gamma_cj_target = (rho0 * (D_cj**2) * 1e-6) / P_cj_theory - 1.0 
     
     # 3. 对数域数据
@@ -75,7 +75,7 @@ def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory):
         A, B, R1, R2, w, C = params
         
         # 物理约束惩罚 (Barrier Method)
-        if A < 0 or B < 0 or C < 0 or w < 0 or w > 1.2 or R1 < (R2 + 0.5) or R2 < 0.1:
+        if A < 0 or B < 0 or C < 0 or w < 0 or w > 1.2 or R1 < (R2 + 1.0) or R2 < 0.1:
             return 1e9
         
         # 模型预测 (Isentrope 形式)
@@ -85,8 +85,8 @@ def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory):
         
         y_pred_log = np.log(np.maximum(P_pred, 1e-6))
         
-        # (A) Log-MSE Loss
-        loss_fit = np.mean((y_pred_log - y_log)**2)
+        # (A) Log-MSE Loss (数据拟合) - 权重降低，给先验留空间
+        loss_fit = np.mean((y_pred_log - y_log)**2) * 50.0
         
         # (B) P_CJ Anchor Penalty
         P_fit_cj = A * np.exp(-R1 * V_cj_rel) + \
@@ -94,28 +94,41 @@ def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory):
                   C / (V_cj_rel**(1.0 + w))
         loss_anchor_P = ((P_fit_cj - P_cj) / P_cj) ** 2 * 100.0
         
-        # (C) Gamma_CJ Anchor Penalty (确保声速/导数连续)
-        # dP/dV analytic derivative:
+        # (C) Gamma_CJ Anchor Penalty
         dP_dV = -A * R1 * np.exp(-R1 * V_cj_rel) - \
                 B * R2 * np.exp(-R2 * V_cj_rel) - \
                 C * (1.0 + w) * (V_cj_rel**-(2.0 + w))
-        
         gamma_pred = -(V_cj_rel / (P_fit_cj + 1e-6)) * dP_dV
         loss_anchor_Gamma = ((gamma_pred - gamma_cj_target) / gamma_cj_target) ** 2 * 50.0 
         
-        return loss_fit + loss_anchor_P + loss_anchor_Gamma
+        # (D) Prior Penalty (文献对标先验)
+        loss_prior = 0.0
+        if exp_priors:
+            ep = exp_priors
+            loss_prior += ((A - ep['A'])/ep['A'])**2 * 5.0
+            loss_prior += ((B - ep['B'])/ep['B'])**2 * 2.0
+            loss_prior += ((R1 - ep['R1'])/ep['R1'])**2 * 10.0
+            loss_prior += ((R2 - ep['R2'])/ep['R2'])**2 * 10.0
+            loss_prior += ((w - ep['omega'])/ep['omega'])**2 * 10.0
+            
+        return loss_fit + loss_anchor_P + loss_anchor_Gamma + loss_prior
 
-    # 5. 优化准备 (初始猜测)
-    x0 = [600.0, 15.0, 4.8, 1.2, 0.35, 1.0]
+    # 5. 优化准备 (使用先验作为初始值)
+    if exp_priors:
+        ep = exp_priors
+        x0 = [ep['A'], ep['B'], ep['R1'], ep['R2'], ep['omega'], 1.0]
+    else:
+        x0 = [600.0, 15.0, 4.8, 1.2, 0.35, 1.0]
     
-    res = minimize(objective, x0, method='Nelder-Mead', tol=1e-5, options={'maxiter': 3000})
+    res = minimize(objective, x0, method='Nelder-Mead', tol=1e-6, options={'maxiter': 5000})
     
-    if not res.success:
-        # Retry with different guess if failed
-        x0 = [P_cj*0.8, P_cj*0.1, 5.0, 1.5, 0.3, 0.5]
-        res = minimize(objective, x0, method='Nelder-Mead', tol=1e-5, options={'maxiter': 3000})
-
     A, B, R1, R2, w, C = res.x
     
-    return JWLParams(A=float(A), B=float(B), R1=float(R1), R2=float(R2), omega=float(w), E0=float(E0))
+    # 计算最终拟合误差 (Log-MSE)
+    P_final = A * np.exp(-R1 * V_rel_array) + \
+             B * np.exp(-R2 * V_rel_array) + \
+             C / (V_rel_array**(1.0 + w))
+    final_mse = np.mean((np.log(np.maximum(P_final, 1e-6)) - y_log)**2)
+    
+    return JWLParams(A=float(A), B=float(B), R1=float(R1), R2=float(R2), omega=float(w), E0=float(E0), fit_mse=float(final_mse))
 

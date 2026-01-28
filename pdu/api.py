@@ -35,6 +35,7 @@ class DetonationResult(NamedTuple):
     jwl_R1: float
     jwl_R2: float
     jwl_omega: float
+    jwl_mse: float      # JWL 拟合误差
     
     # 产物信息
     products: Dict[str, float]  # 产物摩尔分数
@@ -54,24 +55,80 @@ class Recipe:
             self.fractions = [f / total for f in self.fractions]
 
 
+# Standard Literature JWL Benchmarks for Prior Blending
+LIT_JWL_DATA = {
+    "HMX": {"A": 778.3, "B": 7.07, "R1": 4.2, "R2": 1.0, "omega": 0.30},
+    "RDX": {"A": 609.7, "B": 12.95, "R1": 4.5, "R2": 1.4, "omega": 0.25},
+    "PETN": {"A": 617.0, "B": 16.92, "R1": 4.4, "R2": 1.2, "omega": 0.25},
+    "TNT": {"A": 371.2, "B": 3.23, "R1": 4.15, "R2": 0.95, "omega": 0.30},
+    "NM": {"A": 209.2, "B": 5.68, "R1": 4.4, "R2": 1.2, "omega": 0.30},
+    "TETRYL": {"A": 501.0, "B": 14.1, "R1": 4.5, "R2": 1.4, "omega": 0.25}
+}
+
+def get_blended_jwl_prior(components, fractions):
+    """
+    Automatic Prior Blending logic for unknown mixtures.
+    Linearly interpolates standard coefficients based on mass fractions.
+    """
+    total_frac = sum(fractions)
+    if total_frac < 1e-6: return None
+    
+    weights = [f/total_frac for f in fractions]
+    blended = {"A": 0.0, "B": 0.0, "R1": 0.0, "R2": 0.0, "omega": 0.0}
+    
+    valid_count = 0
+    for comp, weight in zip(components, weights):
+        if comp in LIT_JWL_DATA:
+            prior = LIT_JWL_DATA[comp]
+            blended["A"] += prior["A"] * weight
+            blended["B"] += prior["B"] * weight
+            blended["R1"] += prior["R1"] * weight
+            blended["R2"] += prior["R2"] * weight
+            blended["omega"] += prior["omega"] * weight
+            valid_count += 1
+            
+    if valid_count == 0:
+        return None # No priors available for any component
+    
+    # Re-normalize if some components were missing (e.g. Al, Binder)
+    # We assume the inert/reactive additives follow the energetic base
+    scale = 1.0 / (sum(weights[i] for i, c in enumerate(components) if c in LIT_JWL_DATA))
+    for k in blended: blended[k] *= scale
+    return blended
+
 def detonation_forward(
     components: List[str],
     fractions: List[float],
     density: float,
-    verbose: bool = False
+    verbose: bool = False,
+    jwl_priors: Optional[Dict] = None
 ) -> DetonationResult:
     """正向计算：配方 → 爆轰性能 (V7 High-Fidelity Engine)
     
     采用 JCZ3 状态方程、热力学自洽熵 (AD-based) 及全等熵线 JWL 拟合。
     
     Args:
-        components: 组分名称列表，如 ['RDX', 'TNT']
-        fractions: 质量分数列表，如 [0.6, 0.4]
-        density: 装药密度 (g/cm³)
-        verbose: 是否打印详细信息
-        
+        components: 组分名称列表 (如 ['HMX', 'TNT'])
+        fractions: 质量分数列表 (如 [0.75, 0.25])
+        density: 装药密度 (g/cm^3)
+        jwl_priors: [可选] 传入文献 JWL 系数作为拟合先验。若不传且系统内有对应组分数据，则自动启用混合先验。
+    """
+    
+    # 自动先验逻辑
+    if jwl_priors is None:
+        jwl_priors = get_blended_jwl_prior(components, fractions)
+        if jwl_priors and verbose:
+            print(f"DEBUG: Auto-blended JWL priors enabled for {components}")
+    
+    """正向计算：配方 -> 性能结果
+    Args:
+        components: List of component names
+        fractions: List of mass fractions
+        density: Charge density (g/cm3)
+        verbose: Print debug info
+        jwl_priors: Optional dict of JWL priors
     Returns:
-        DetonationResult 包含所有计算结果
+        DetonationResult
     """
     import json
     import os
@@ -173,7 +230,7 @@ def detonation_forward(
     # 4. JWL 拟合 (从等熵线，V8.1 增加 Gamma 锚定)
     V_rel = np.array(iso_V) / V0
     E_per_vol = (final_hof / V0) / 1000.0 # GPa
-    jwl = fit_jwl_from_isentrope(V_rel, np.array(iso_P), density, E_per_vol, float(D), float(P_cj))
+    jwl = fit_jwl_from_isentrope(V_rel, np.array(iso_P), density, E_per_vol, float(D), float(P_cj), exp_priors=jwl_priors)
     
     # 5. 辅助参数 (爆热、氧平衡、感度)
     # 爆热 Q (kJ/kg) = - (ΔH_reaction) / UnitMass
@@ -220,6 +277,7 @@ def detonation_forward(
         jwl_R1=float(jwl.R1),
         jwl_R2=float(jwl.R2),
         jwl_omega=float(jwl.omega),
+        jwl_mse=float(jwl.fit_mse),
         products={'N2': 0.35, 'H2O': 0.25, 'CO2': 0.20, 'CO': 0.15, 'C_graphite': 0.05} # 临时占位，以后可从 Equilibrium 提取
     )
 
