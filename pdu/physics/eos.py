@@ -122,6 +122,31 @@ def compute_effective_diameter_ratio(T, epsilon, alpha):
     return jnp.clip(ratio, 0.4, 1.2)
 
 @jax.jit
+def compute_solid_volume_murnaghan(solid_v0, P_est, is_carbon, is_alumina):
+    """
+    计算凝聚相动态体积 (Murnaghan EOS)
+    V(P) = V0 * (1 + n*P/K0)^(-1/n)
+    """
+    # 参数设定
+    # Carbon: K0=30 GPa (拟合纳米碳), n=5.0
+    # Alumina: K0=150 GPa, n=4.0
+    
+    # 1. 碳 (Carbon)
+    # 基础相变系数调整为 0.74 (对应密度 ~3.0 g/cm3，而非 0.645 的 3.5 g/cm3)
+    c_base_factor = 0.74
+    c_compress = jnp.power(1.0 + 5.0 * P_est / 30e9, -1.0/5.0)
+    vol_c = solid_v0 * c_base_factor * c_compress
+    
+    # 2. 氧化铝 (Alumina)
+    al_compress = jnp.power(1.0 + 4.0 * P_est / 150e9, -1.0/4.0)
+    vol_al = solid_v0 * 1.32 * al_compress
+    
+    # 3. 组合
+    v_final = jnp.where(is_carbon, vol_c, solid_v0)
+    v_final = jnp.where(is_alumina, vol_al, v_final)
+    return v_final
+
+@jax.jit
 def compute_covolume(n, r_star_matrix, T=None, epsilon_matrix=None, alpha_matrix=None):
     """b = (2π/3) * N_A * ΣΣ x_i x_j d_ij^3  * n_total ? 
     Standard One-Fluid: b_mix = sum x_i x_j b_ij
@@ -182,25 +207,24 @@ def compute_total_helmholtz_energy(
     n_gas = n * (1.0 - solid_mask)
     n_gas_total = jnp.sum(n_gas) + 1e-30
 
-    # 3. 体积扣除 (V8.3 Fix: 物理相态体积修正)
-    # 物理背景: 
-    # 1. 碳 (Graphite -> Diamond): 在爆轰高压下固相体积显著收缩 (V_eff ~ 0.645 * V_0)
-    # 2. 氧化铝 (Solid -> Liquid Droplet): 由于 CJ 温度高于熔点，产物为液相，体积显著膨胀 (V_eff ~ 1.32 * V_0)
-    compress_factors = jnp.ones_like(solid_v0)
-    
-    # 自动识别策略 (基于 V0 值段的工程识别):
-    # 碳 (Graphite V0 ~ 5.3)
+    # === [V8.4 Patch Start] ===
+    # 估算压力 P_est 用于固相压缩 (利用理想气体定律近似，避免循环依赖)
+    # P ~ (n_gas * R * T) / (V_total * 0.6 * 1e-6) 假设气体约占总容积 60%
+    n_gas_sum = jnp.sum(n_gas) + 1e-10
+    P_proxy = (n_gas_sum * 8.314 * T) / (V_total * 0.6 * 1e-6) 
+    P_proxy = jnp.maximum(P_proxy, 1e5)
+
+    # 识别组分
     is_carbon = (solid_v0 > 5.0) & (solid_v0 < 6.0)
-    compress_factors = jnp.where(is_carbon, 0.645, compress_factors)
-    
-    # 氧化铝 (Al2O3 V0 ~ 25.6)
     is_alumina = (solid_v0 > 24.0) & (solid_v0 < 27.0)
-    compress_factors = jnp.where(is_alumina, 1.32, compress_factors)
+
+    # 计算动态有效体积
+    solid_vol_eff = compute_solid_volume_murnaghan(solid_v0, P_proxy, is_carbon, is_alumina)
     
-    # 计算有效凝聚相体积
-    V_condensed_eff = jnp.sum(n_solid * solid_v0 * compress_factors)
-    V_gas_eff = jnp.maximum(V_total - V_condensed_eff, 1e-2) 
+    V_condensed_eff = jnp.sum(n_solid * solid_vol_eff)
+    V_gas_eff = jnp.maximum(V_total - V_condensed_eff, 1e-3)
     V_gas_m3 = V_gas_eff * 1e-6
+    # === [V8.4 Patch End] ===
 
     # === 4. 气相自由能 (JCZ3 + Ideal Gas) ===
     # (A) 理想气体

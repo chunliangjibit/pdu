@@ -1,23 +1,26 @@
 {
   "species": {
     "N2": {
+      "note": "Alpha stiffened to 14.4 for V8.4",
       "epsilon_over_k": 108.0,
-      "r_star": 4.15,
-      "alpha": 13.8
+      "r_star": 4.16,
+      "alpha": 14.4
     },
     "CO2": {
+      "note": "Alpha stiffened to 14.2 for V8.4",
       "epsilon_over_k": 255.0,
-      "r_star": 4.35,
-      "alpha": 13.8
+      "r_star": 4.30,
+      "alpha": 14.2
     },
     "H2O": {
+      "note": "Stiffened to r*=3.52, alpha=15.2 for V8.4",
       "epsilon_over_k": 380.0,
-      "r_star": 3.40,
-      "alpha": 14.5
+      "r_star": 3.52,
+      "alpha": 15.2
     },
     "CO": {
       "epsilon_over_k": 108.0,
-      "r_star": 4.10,
+      "r_star": 3.85,
       "alpha": 13.0
     },
     "NO": {
