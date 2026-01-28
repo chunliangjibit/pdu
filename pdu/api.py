@@ -170,10 +170,10 @@ def detonation_forward(
         solid_mask, solid_v0
     )
     
-    # 4. JWL 拟合 (从等熵线)
+    # 4. JWL 拟合 (从等熵线，V8.1 增加 Gamma 锚定)
     V_rel = np.array(iso_V) / V0
     E_per_vol = (final_hof / V0) / 1000.0 # GPa
-    jwl = fit_jwl_from_isentrope(V_rel, np.array(iso_P), density, E_per_vol)
+    jwl = fit_jwl_from_isentrope(V_rel, np.array(iso_P), density, E_per_vol, float(D), float(P_cj))
     
     # 5. 辅助参数 (爆热、氧平衡、感度)
     # 爆热 Q (kJ/kg) = - (ΔH_reaction) / UnitMass

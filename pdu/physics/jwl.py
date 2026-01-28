@@ -50,28 +50,31 @@ def jwl_pressure(V_rel, A, B, R1, R2, omega, E_per_vol):
     # Usually we fit this P_s form.
     pass
 
-def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0):
+def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory):
     """
-    V8: Robust Log-Space Fitting with CJ Anchoring
+    V8.1: Robust Log-Space Fitting with Gamma-CJ Anchoring
     
-    采用对数域损失函数均衡高低压误差，并强制锚定 CJ 点起点的物理一致性。
+    采用对数域损失函数均衡高低压误差，并增加绝热指数 (Gamma) 锚定以保证 CJ 点能量导数连续性。
     """
     from scipy.optimize import minimize
     import numpy as np
 
-    # 1. 锚点数据 (CJ 点)
+    # 1. 物理锚点数据 (CJ 点)
     V_cj_rel = V_rel_array[0]
     P_cj = P_array[0]
     
-    # 2. 对数域数据 (用于平衡 30GPa 和 0.1GPa 的权重)
+    # 2. 计算物理目标 Gamma (绝热指数)
+    # Gamma_CJ ≈ (rho0 * D^2) / P_CJ - 1
+    gamma_cj_target = (rho0 * (D_cj**2) * 1e-6) / P_cj_theory - 1.0 
+    
+    # 3. 对数域数据
     y_log = np.log(np.maximum(P_array, 1e-4))
     
-    # 3. 目标函数
+    # 4. 目标函数
     def objective(params):
         A, B, R1, R2, w, C = params
         
         # 物理约束惩罚 (Barrier Method)
-        # 强制 R1 > R2 + 0.5 防止模态合并；强制 w 在物理区间
         if A < 0 or B < 0 or C < 0 or w < 0 or w > 1.2 or R1 < (R2 + 0.5) or R2 < 0.1:
             return 1e9
         
@@ -82,25 +85,37 @@ def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0):
         
         y_pred_log = np.log(np.maximum(P_pred, 1e-6))
         
-        # Log-MSE: 使得低压段的相对误差与高压段同等重要
+        # (A) Log-MSE Loss
         loss_fit = np.mean((y_pred_log - y_log)**2)
         
-        # CJ Anchor Penalty: 强行拉回起点，保证爆轰瞬态物理正确
-        P_cj_pred = A * np.exp(-R1 * V_cj_rel) + \
-                    B * np.exp(-R2 * V_cj_rel) + \
-                    C / (V_cj_rel**(1.0 + w))
-        loss_anchor = ((P_cj_pred - P_cj) / P_cj) ** 2 * 100.0 # 100倍权重锚点
+        # (B) P_CJ Anchor Penalty
+        P_fit_cj = A * np.exp(-R1 * V_cj_rel) + \
+                  B * np.exp(-R2 * V_cj_rel) + \
+                  C / (V_cj_rel**(1.0 + w))
+        loss_anchor_P = ((P_fit_cj - P_cj) / P_cj) ** 2 * 100.0
         
-        return loss_fit + loss_anchor
+        # (C) Gamma_CJ Anchor Penalty (确保声速/导数连续)
+        # dP/dV analytic derivative:
+        dP_dV = -A * R1 * np.exp(-R1 * V_cj_rel) - \
+                B * R2 * np.exp(-R2 * V_cj_rel) - \
+                C * (1.0 + w) * (V_cj_rel**-(2.0 + w))
+        
+        gamma_pred = -(V_cj_rel / (P_fit_cj + 1e-6)) * dP_dV
+        loss_anchor_Gamma = ((gamma_pred - gamma_cj_target) / gamma_cj_target) ** 2 * 50.0 
+        
+        return loss_fit + loss_anchor_P + loss_anchor_Gamma
 
-    # 4. 优化准备 (初始猜测)
-    # A, B, R1, R2, w, C
+    # 5. 优化准备 (初始猜测)
     x0 = [600.0, 15.0, 4.8, 1.2, 0.35, 1.0]
     
-    res = minimize(objective, x0, method='Nelder-Mead', tol=1e-5, options={'maxiter': 2000})
+    res = minimize(objective, x0, method='Nelder-Mead', tol=1e-5, options={'maxiter': 3000})
     
+    if not res.success:
+        # Retry with different guess if failed
+        x0 = [P_cj*0.8, P_cj*0.1, 5.0, 1.5, 0.3, 0.5]
+        res = minimize(objective, x0, method='Nelder-Mead', tol=1e-5, options={'maxiter': 3000})
+
     A, B, R1, R2, w, C = res.x
     
-    # 返回标准 JWL 参数结构
     return JWLParams(A=float(A), B=float(B), R1=float(R1), R2=float(R2), omega=float(w), E0=float(E0))
 

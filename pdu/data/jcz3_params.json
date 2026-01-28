@@ -1,48 +1,43 @@
 {
   "species": {
     "N2": {
-      "epsilon_over_k": 103.58,
-      "r_star": 5.95,
-      "alpha": 13.6
-    },
-    "H2O": {
-      "epsilon_over_k": 392.07,
-      "r_star": 3.35,
-      "alpha": 13.8
+      "epsilon_over_k": 101.9,
+      "r_star": 4.30,
+      "alpha": 13.5
     },
     "CO2": {
-      "epsilon_over_k": 246.49,
-      "r_star": 4.85,
-      "alpha": 13.4
+      "epsilon_over_k": 246.0,
+      "r_star": 4.50,
+      "alpha": 13.5
+    },
+    "H2O": {
+      "epsilon_over_k": 356.0,
+      "r_star": 3.45,
+      "alpha": 13.5
     },
     "CO": {
-      "epsilon_over_k": 110.27,
-      "r_star": 4.35,
-      "alpha": 13.8
+      "epsilon_over_k": 108.0,
+      "r_star": 4.10,
+      "alpha": 13.0
     },
     "NO": {
-      "epsilon_over_k": 102.08,
-      "r_star": 5.48,
-      "alpha": 13.57
+      "epsilon_over_k": 118.0,
+      "r_star": 3.65,
+      "alpha": 13.0
     },
     "CH4": {
-      "epsilon_over_k": 98.65,
-      "r_star": 2.16,
-      "alpha": 13.24
-    },
-    "C_graphite": {
-      "epsilon_over_k": 30.6,
-      "r_star": 4.00,
-      "alpha": 12.0
+      "epsilon_over_k": 142.0,
+      "r_star": 3.95,
+      "alpha": 13.0
     },
     "H2": {
-      "epsilon_over_k": 36.4,
-      "r_star": 3.34,
-      "alpha": 11.5
+      "epsilon_over_k": 32.0,
+      "r_star": 3.10,
+      "alpha": 11.0
     },
     "O2": {
-      "epsilon_over_k": 121.1,
-      "r_star": 3.66,
+      "epsilon_over_k": 118.0,
+      "r_star": 3.60,
       "alpha": 13.0
     },
     "OH": {
@@ -60,10 +55,15 @@
       "r_star": 4.50,
       "alpha": 14.0
     },
+    "C_graphite": {
+      "epsilon_over_k": 30.6,
+      "r_star": 3.50,
+      "alpha": 12.0
+    },
     "Al2O3": {
-      "epsilon_over_k": 4998.05,
+      "epsilon_over_k": 5000.0,
       "r_star": 3.15,
-      "alpha": 14.1
+      "alpha": 14.0
     }
   }
 }
