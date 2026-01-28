@@ -234,8 +234,15 @@ def detonation_forward(
     
     # 5. 辅助参数 (爆热、氧平衡、感度)
     # 爆热 Q (kJ/kg) = - (ΔH_reaction) / UnitMass
-    # 这里使用简单的 Q 估计，或者从 CJ 结果提取
-    Q = abs(final_hof) / (final_mw / 1000.0) / 1000.0 # 粗略能值估计
+    # Q = [Sum(n_i * Hf_i)_products - Hf_explosive]
+    # For a high-fidelity estimate, we use the internal energy change at CJ point
+    # or simple heat release at standard state. 
+    # Here we estimate Q as the net energy released to the products:
+    from pdu.physics.thermo import compute_gibbs_batch
+    mu_std = compute_gibbs_batch(atom_vec, coeffs_all, 298.15) # Standard state G/RT
+    G_products_std = jnp.dot(mu_std, atom_vec) * R_GAS * 298.15 # J/mol
+    Q = (final_hof - float(G_products_std)) / (final_mw / 1000.0) / 1000.0
+    Q = abs(Q) # Energy released
     
     # 氧平衡
     from pdu.physics.sensitivity import compute_oxygen_balance
