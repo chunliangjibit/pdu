@@ -233,16 +233,18 @@ def detonation_forward(
     jwl = fit_jwl_from_isentrope(V_rel, np.array(iso_P), density, E_per_vol, float(D), float(P_cj), exp_priors=jwl_priors)
     
     # 5. 辅助参数 (爆热、氧平衡、感度)
-    # 爆热 Q (kJ/kg) = - (ΔH_reaction) / UnitMass
-    # Q = [Sum(n_i * Hf_i)_products - Hf_explosive]
-    # For a high-fidelity estimate, we use the internal energy change at CJ point
-    # or simple heat release at standard state. 
-    # Here we estimate Q as the net energy released to the products:
-    from pdu.physics.thermo import compute_gibbs_batch
-    mu_std = compute_gibbs_batch(atom_vec, coeffs_all, 298.15) # Standard state G/RT
-    G_products_std = jnp.dot(mu_std, atom_vec) * R_GAS * 298.15 # J/mol
-    Q = (final_hof - float(G_products_std)) / (final_mw / 1000.0) / 1000.0
-    Q = abs(Q) # Energy released
+    # 爆热 Q (kJ/kg) = [Hf_reactant - Hf_standard_products] / Mass
+    # 为了简化计算并保证诚实性，我们使用基于原子守恒的理想化产物估算 (CO2, H2O, N2, Al2O3, C)
+    mol_CO2 = min(atom_vec[0], atom_vec[2] / 2.0) if 'O' in ELEMENT_LIST else 0.0
+    mol_H2O = min(atom_vec[1] / 2.0, max(0.0, (atom_vec[2] - 2*mol_CO2))) if 'H' in ELEMENT_LIST else 0.0
+    Hf_CO2 = -393.5 * 1000.0 # J/mol
+    Hf_H2O = -241.8 * 1000.0 # J/mol
+    Hf_Al2O3 = -1675.7 * 1000.0 # J/mol
+    
+    mol_Al2O3 = atom_vec[ELEMENT_LIST.index('Al')] / 2.0 if 'Al' in ELEMENT_LIST else 0.0
+    H_prod = mol_CO2 * Hf_CO2 + mol_H2O * Hf_H2O + mol_Al2O3 * Hf_Al2O3
+    Q = (final_hof - H_prod) / (final_mw / 1000.0) / 1000.0
+    Q = abs(float(Q)) # 释放的能量 kJ/kg
     
     # 氧平衡
     from pdu.physics.sensitivity import compute_oxygen_balance
