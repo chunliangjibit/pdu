@@ -192,7 +192,8 @@ def detonation_forward(
     
     total_moles = 0.0
     equiv_formula = {e: 0.0 for e in ELEMENT_LIST}
-    equiv_hof = 0.0 # J/mol
+    equiv_hof = 0.0 # Enthalpy (J/mol)
+    equiv_internal_energy = 0.0 # Internal Energy (J/mol)
     equiv_mw = 0.0
     
     for i, name in enumerate(components):
@@ -206,17 +207,31 @@ def detonation_forward(
             if elem in equiv_formula:
                 equiv_formula[elem] += n_mol * count
         
+        # Enthalpy (Heat of Formation)
         equiv_hof += n_mol * comp.heat_of_formation * 1000.0 # kJ -> J
-        equiv_mw += w * comp.molecular_weight # This is mass fraction weighted mw? No.
+        
+        # Internal Energy (with Delta n_gas RT correction)
+        # 优先使用 internal_energy_of_formation 属性 (V8.5+)
+        if hasattr(comp, 'internal_energy_of_formation'):
+            u_formation = comp.internal_energy_of_formation
+        else:
+            # Fallback for old component data objects if any
+            u_formation = comp.heat_of_formation 
+            
+        equiv_internal_energy += n_mol * u_formation * 1000.0 # kJ -> J
+
+        equiv_mw += w * comp.molecular_weight
     
     # 归一化为 1 摩尔等效物质
     atom_vec = jnp.array([equiv_formula[e] / total_moles for e in ELEMENT_LIST])
-    final_hof = equiv_hof / total_moles
+    final_hof = equiv_hof / total_moles  # J/mol (Enthalpy)
+    final_internal_energy = equiv_internal_energy / total_moles # J/mol (Internal Energy)
+    
     final_mw = sum([atom_vec[i] * atomic_masses[i] for i in range(len(ELEMENT_LIST))])
     
-    # CJ 初始状态 (V0 in cm3/mol, E0 in J/mol)
+    # V8.5 Fix: 使用内能 E0 初始化 CJ 求解器，而非焓 H0
     V0 = final_mw / (density * 1.0) # V = M/rho
-    E0 = final_hof
+    E0 = final_internal_energy
     
     # 3. 核心计算 (JCZ3 V7)
     if verbose: print(f"Executing V7 High-Fidelity calculation for {components} at rho={density}...")
@@ -229,22 +244,44 @@ def detonation_forward(
     
     # 4. JWL 拟合 (从等熵线，V8.1 增加 Gamma 锚定)
     V_rel = np.array(iso_V) / V0
-    E_per_vol = (final_hof / V0) / 1000.0 # GPa
+    E_per_vol = (final_internal_energy / V0) / 1000.0 # GPa (Using Internal Energy)
     jwl = fit_jwl_from_isentrope(V_rel, np.array(iso_P), density, E_per_vol, float(D), float(P_cj), exp_priors=jwl_priors)
     
     # 5. 辅助参数 (爆热、氧平衡、感度)
-    # 爆热 Q (MJ/kg) = [Hf_reactant - Hf_standard_products] / Mass
-    # 使用基于原子守恒的理想化产物估算 (CO2, H2O, N2, Al2O3, C)
-    #  Note: 该方法对缺氧炸药(TNT/PETN)精度较低，V8.5 将改用 CJ 产物实际组成
-    mol_CO2 = min(atom_vec[0], atom_vec[2] / 2.0) if 'O' in ELEMENT_LIST else 0.0
-    mol_H2O = min(atom_vec[1] / 2.0, max(0.0, (atom_vec[2] - 2*mol_CO2))) if 'H' in ELEMENT_LIST else 0.0
-    Hf_CO2 = -393.5 * 1000.0  # J/mol
-    Hf_H2O = -241.8 * 1000.0  # J/mol (gas)
-    Hf_Al2O3 = -1675.7 * 1000.0  # J/mol
+    # 爆热 Q (MJ/kg) = [U_reactant - U_products] / Mass
+    # V8.5 Update: 修正了氧原子索引错误 (使用 'O' 而非 'N')
+    # V8.5 Update: 使用内能计算 Q (Consistent with CJ solver)
     
-    mol_Al2O3 = atom_vec[ELEMENT_LIST.index('Al')] / 2.0 if 'Al' in ELEMENT_LIST else 0.0
-    H_prod = mol_CO2 * Hf_CO2 + mol_H2O * Hf_H2O + mol_Al2O3 * Hf_Al2O3
-    Q = (final_hof - H_prod) / (final_mw / 1000.0) / 1000.0 / 1000.0  # MJ/kg (J/mol → kJ/kg → MJ/kg)
+    idx_C = ELEMENT_LIST.index('C') if 'C' in ELEMENT_LIST else -1
+    idx_H = ELEMENT_LIST.index('H') if 'H' in ELEMENT_LIST else -1
+    idx_O = ELEMENT_LIST.index('O') if 'O' in ELEMENT_LIST else -1
+    idx_Al = ELEMENT_LIST.index('Al') if 'Al' in ELEMENT_LIST else -1
+    
+    mol_CO2 = min(atom_vec[idx_C], atom_vec[idx_O] / 2.0) if idx_O >= 0 and idx_C >= 0 else 0.0
+    
+    remaining_O = atom_vec[idx_O] - 2*mol_CO2 if idx_O >= 0 else 0.0
+    mol_H2O = min(atom_vec[idx_H] / 2.0, max(0.0, remaining_O)) if idx_H >= 0 else 0.0
+    
+    # Enthalpies of formation (J/mol)
+    Hf_CO2 = -393.5 * 1000.0 
+    Hf_H2O = -241.8 * 1000.0  # gas
+    Hf_Al2O3 = -1675.7 * 1000.0
+    
+    # Convert Product H -> U (assume gas except Al2O3)
+    # U = H - PV = H - nRT = H - 1*RT
+    R = 8.314462618 # J/(mol K)
+    T = 298.15
+    Uf_CO2 = Hf_CO2 - 1.0 * R * T
+    Uf_H2O = Hf_H2O - 1.0 * R * T
+    Uf_Al2O3 = Hf_Al2O3 # solid, negligible PV work in formation? Agrees with report.
+    
+    mol_Al2O3 = atom_vec[idx_Al] / 2.0 if idx_Al >= 0 else 0.0
+    
+    # Simple Energy Release based on U
+    U_prod = mol_CO2 * Uf_CO2 + mol_H2O * Uf_H2O + mol_Al2O3 * Uf_Al2O3
+    
+    # Q = U_react - U_prod
+    Q = (final_internal_energy - U_prod) / (final_mw / 1000.0) / 1000.0 / 1000.0 # MJ/kg
     Q = abs(float(Q))
     
     # 氧平衡

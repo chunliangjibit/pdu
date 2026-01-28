@@ -23,6 +23,46 @@ class ComponentData:
     oxygen_balance: float  # %
     category: str
     
+    @property
+    def internal_energy_of_formation(self) -> float:
+        """计算标准生成内能 ΔfU° (kJ/mol)
+        
+        ΔfU° = ΔfH° - Δ(PV)
+        Δ(PV) ≈ Δn_gas * RT
+        
+        Reaction: Elements -> Compound(s)
+        Δn_gas = n_gas_products (0) - n_gas_reactants
+        
+        Standard states:
+        H -> 1/2 H2(g)
+        N -> 1/2 N2(g)
+        O -> 1/2 O2(g)
+        F -> 1/2 F2(g)
+        Cl -> 1/2 Cl2(g)
+        C -> C(graphite, s)
+        B -> B(s)
+        Al -> Al(s)
+        """
+        # 气体分子原子数
+        gas_elements = {'H': 2, 'N': 2, 'O': 2, 'F': 2, 'Cl': 2}
+        
+        n_gas_reactants = 0.0
+        for elem, atoms_per_mol in gas_elements.items():
+            n_atom = self.formula.get(elem, 0)
+            n_gas_reactants += n_atom / atoms_per_mol
+            
+        # 假设生成物是固/液态 (n_gas_products = 0)
+        # TODO: 如果未来支持气态反应物输入，这里需调整
+        delta_n_gas = 0.0 - n_gas_reactants
+        
+        R = 8.314462618e-3  # kJ/(mol·K)
+        T = 298.15          # K
+        
+        work_term = delta_n_gas * R * T
+        
+        # ΔU = ΔH - Δ(PV)
+        return self.heat_of_formation - work_term
+
     def to_atom_vector(self, elements: List[str] = None) -> jnp.ndarray:
         """转换为原子向量
         

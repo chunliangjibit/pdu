@@ -1,22 +1,22 @@
 {
   "species": {
     "N2": {
-      "note": "Alpha stiffened to 14.4 for V8.4",
-      "epsilon_over_k": 108.0,
-      "r_star": 4.16,
-      "alpha": 14.4
+      "note": "JCZS3 Expert Calibration (Liquid N2 Hugoniot)",
+      "epsilon_over_k": 103.0,
+      "r_star": 4.11,
+      "alpha": 13.0
     },
     "CO2": {
-      "note": "Alpha stiffened to 14.2 for V8.4",
-      "epsilon_over_k": 255.0,
+      "note": "JCZS3 Expert Calibration (Liquid CO2 Hugoniot)",
+      "epsilon_over_k": 240.0,
       "r_star": 4.30,
-      "alpha": 14.2
+      "alpha": 13.0
     },
     "H2O": {
-      "note": "Stiffened to r*=3.52, alpha=15.2 for V8.4",
-      "epsilon_over_k": 380.0,
-      "r_star": 3.52,
-      "alpha": 15.2
+      "note": "JCZS3 Expert Calibration (Spherical Approx)",
+      "epsilon_over_k": 333.0,
+      "r_star": 3.27,
+      "alpha": 13.0
     },
     "CO": {
       "epsilon_over_k": 108.0,
