@@ -51,11 +51,18 @@ def jwl_pressure(V_rel, A, B, R1, R2, omega, E_per_vol):
     # Usually we fit this P_s form.
     pass
 
-def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory, exp_priors=None):
+def fit_jwl_from_isentrope(
+    V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory, 
+    exp_priors=None,
+    constraint_P_cj: float = None,  # GPa
+    constraint_D_exp: float = None  # m/s
+):
     """
-    V8.5: Prior-Aware Robust Fitting
+    V8.6: Prior-Aware Robust Fitting with Engineering Bias Constraint
     
-    增加文献先验约束，平衡数学解的冗余性，优先寻找靠近标准 Basin 的物理参数。
+    Args:
+        constraint_P_cj: Optional experimental P_CJ to anchor the fitting (Engineering Bias).
+        constraint_D_exp: Optional experimental Detonation Velocity for Rayleigh line validation.
     """
     from scipy.optimize import minimize
     import numpy as np
@@ -66,6 +73,18 @@ def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory, ex
     
     # 2. 计算物理目标 Gamma (绝热指数)
     gamma_cj_target = (rho0 * (D_cj**2) * 1e-6) / P_cj_theory - 1.0 
+    
+    # [V8.6] Engineering Constraint Target
+    target_P_cj = None
+    target_V_cj = None
+    if constraint_P_cj is not None and constraint_D_exp is not None:
+        # Calculate consistent V_cj on the Rayleigh line: P = rho0 * D^2 * (1 - V)
+        # 1 - V = P / (rho0 * D^2)
+        # V = 1 - P / (rho0 * D^2)
+        term = (constraint_P_cj * 1e9) / (rho0 * (constraint_D_exp**2))
+        target_V_cj = 1.0 - term
+        target_P_cj = constraint_P_cj
+        print(f"[JWL Bias] Enforcing P_CJ={target_P_cj} GPa, V_CJ={target_V_cj:.4f} (D={constraint_D_exp})")
     
     # 3. 对数域数据
     y_log = np.log(np.maximum(P_array, 1e-4))
@@ -89,18 +108,28 @@ def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory, ex
         loss_fit = np.mean((y_pred_log - y_log)**2) * 50.0
         
         # (B) P_CJ Anchor Penalty
-        P_fit_cj = A * np.exp(-R1 * V_cj_rel) + \
-                  B * np.exp(-R2 * V_cj_rel) + \
-                  C / (V_cj_rel**(1.0 + w))
-        loss_anchor_P = ((P_fit_cj - P_cj) / P_cj) ** 2 * 100.0
+        # If constraint is active, anchor to target. Else anchor to predicted CJ point.
+        if target_P_cj is not None:
+             P_fit_cj = A * np.exp(-R1 * target_V_cj) + \
+                       B * np.exp(-R2 * target_V_cj) + \
+                       C / (target_V_cj**(1.0 + w))
+             loss_anchor_P = ((P_fit_cj - target_P_cj) / target_P_cj) ** 2 * 10000.0 # Strict constraint
+        else:
+             P_fit_cj = A * np.exp(-R1 * V_cj_rel) + \
+                       B * np.exp(-R2 * V_cj_rel) + \
+                       C / (V_cj_rel**(1.0 + w))
+             loss_anchor_P = ((P_fit_cj - P_cj) / P_cj) ** 2 * 100.0
         
-        # (C) Gamma_CJ Anchor Penalty
-        dP_dV = -A * R1 * np.exp(-R1 * V_cj_rel) - \
-                B * R2 * np.exp(-R2 * V_cj_rel) - \
-                C * (1.0 + w) * (V_cj_rel**-(2.0 + w))
-        gamma_pred = -(V_cj_rel / (P_fit_cj + 1e-6)) * dP_dV
-        loss_anchor_Gamma = ((gamma_pred - gamma_cj_target) / gamma_cj_target) ** 2 * 50.0 
-        
+        # (C) Gamma_CJ Anchor Penalty (Only used for self-consistent fit)
+        if target_P_cj is None:
+            dP_dV = -A * R1 * np.exp(-R1 * V_cj_rel) - \
+                    B * R2 * np.exp(-R2 * V_cj_rel) - \
+                    C * (1.0 + w) * (V_cj_rel**-(2.0 + w))
+            gamma_pred = -(V_cj_rel / (P_fit_cj + 1e-6)) * dP_dV
+            loss_anchor_Gamma = ((gamma_pred - gamma_cj_target) / gamma_cj_target) ** 2 * 50.0 
+        else:
+            loss_anchor_Gamma = 0.0 # Disable Gamma anchor if forcing P_CJ bias
+            
         # (D) Prior Penalty (文献对标先验)
         loss_prior = 0.0
         if exp_priors:
@@ -131,4 +160,5 @@ def fit_jwl_from_isentrope(V_rel_array, P_array, rho0, E0, D_cj, P_cj_theory, ex
     final_mse = np.mean((np.log(np.maximum(P_final, 1e-6)) - y_log)**2)
     
     return JWLParams(A=float(A), B=float(B), R1=float(R1), R2=float(R2), omega=float(w), E0=float(E0), fit_mse=float(final_mse))
+
 
