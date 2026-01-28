@@ -148,12 +148,13 @@ jax.config.update("jax_debug_nans", True)
    - 含铝：Tritonal (TNT/Al), PBXN-109 (RDX/Al/Binder)
 2. **对标参数集**：
    - 基础：$D$ (爆速)、$P_{CJ}$ (爆压)、$T_{CJ}$ (爆温)、$Q$ (爆热)
-   - 状态方程：JWL 系数 ($A, B, R_1, R_2, \omega$) 及其物理曲线 MAE
+   - **JWL 完整系数**：$A, B, R_1, R_2, \omega$ 必须全部列出并对标。**严禁只列出 A 和 $\omega$。**
+   - 物理曲线：$P-V$ 曲线的 MAE (Mean Absolute Error)
 3. **数据来源**：必须明确标注实验值来源（如 LLNL, EXPLO5, 经典文献）
 4. **诚实原则 (Honest Disclosure)**：禁止对误差进行任何形式的包装或掩盖。
-   - 所有的物理参数（D, P, T, Q, JWL）误差必须如实反映在 `v8_performance_report.md` 中。
+   - 所有的物理参数（D, P, T, Q, JWL-5参数）误差必须如实反映在 `v8_performance_report.md` 中。
    - 若物理模型在此点位失效（如爆温偏差 > 15%），必须明确标记为“待优化物理点”，作为下一阶段校准的目标。
-   - 杜绝“只报爆速，不报爆压/爆温”的行为。
+   - 杜绝“只报爆速，不报爆压/爆温”或“JWL 参数缺失”的行为。
 
 ### 5.3 误差阈值标准 (Target)
 | 参数 | 核心单体 (HMX/RDX) | 混合/含铝炸药 |
