@@ -43,7 +43,7 @@ class ComponentData:
 
 # 全局缓存
 _COMPONENTS_CACHE: Optional[Dict[str, ComponentData]] = None
-_DATA_DIR = Path(__file__).parent.parent.parent / "data_raw"
+_DATA_DIR = Path(__file__).parent
 
 
 def _get_data_dir() -> Path:
@@ -65,7 +65,7 @@ def load_components(reload: bool = False) -> Dict[str, ComponentData]:
     if _COMPONENTS_CACHE is not None and not reload:
         return _COMPONENTS_CACHE
     
-    data_path = _get_data_dir() / "components.json"
+    data_path = _get_data_dir() / "reactants.json"
     
     with open(data_path, 'r', encoding='utf-8') as f:
         raw_data = json.load(f)
@@ -80,13 +80,13 @@ def load_components(reload: bool = False) -> Dict[str, ComponentData]:
         for name, data in raw_data[category_key].items():
             components[name] = ComponentData(
                 name=name,
-                full_name=data['full_name'],
+                full_name=data.get('name', name),
                 formula=data['formula'],
-                molecular_weight=data['molecular_weight'],
+                molecular_weight=data.get('molecular_weight', data.get('effective_Mw', data.get('molecular_weight_effective', 0.0))),
                 density=data['density'],
-                heat_of_formation=data['heat_of_formation'],
-                oxygen_balance=data['oxygen_balance'],
-                category=data['category']
+                heat_of_formation=data.get('enthalpy_formation', 0.0),
+                oxygen_balance=data.get('oxygen_balance', 0.0),
+                category=data.get('type', 'other')
             )
     
     _COMPONENTS_CACHE = components

@@ -36,7 +36,7 @@ class ProductData:
 # 全局缓存
 _PRODUCTS_CACHE: Optional[Dict[str, ProductData]] = None
 _JCZ3_CACHE: Optional[Dict] = None
-_DATA_DIR = Path(__file__).parent.parent.parent / "data_raw"
+_DATA_DIR = Path(__file__).parent
 
 
 def _get_data_dir() -> Path:
@@ -68,7 +68,7 @@ def load_products(reload: bool = False) -> Dict[str, ProductData]:
     for name, data in raw_data.get('species', {}).items():
         products[name] = ProductData(
             name=name,
-            full_name=data['name'],
+            full_name=data.get('name', name),
             molecular_weight=data['molecular_weight'],
             phase=data['phase'],
             coeffs_high=jnp.array(data['coeffs_high']),
