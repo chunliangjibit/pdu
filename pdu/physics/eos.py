@@ -182,19 +182,24 @@ def compute_total_helmholtz_energy(
     n_gas = n * (1.0 - solid_mask)
     n_gas_total = jnp.sum(n_gas) + 1e-30
 
-    # 3. 体积扣除 (V8.1 Fix: 固相高压体积修正)
-    # 物理背景: 在爆轰压力下，碳以类金刚石形态存在 (V_eff ~ 0.65 * V_graphite)
-    # Al2O3 为硬陶瓷，压缩较小 (V_eff ~ 0.92 * V_0)
+    # 3. 体积扣除 (V8.3 Fix: 物理相态体积修正)
+    # 物理背景: 
+    # 1. 碳 (Graphite -> Diamond): 在爆轰高压下固相体积显著收缩 (V_eff ~ 0.645 * V_0)
+    # 2. 氧化铝 (Solid -> Liquid Droplet): 由于 CJ 温度高于熔点，产物为液相，体积显著膨胀 (V_eff ~ 1.32 * V_0)
     compress_factors = jnp.ones_like(solid_v0)
-    # 自动识别策略 (基于 V0 值段的工程识别):
-    # 碳 (Graphite V0 ~ 5.3): 压缩至金刚石密度
-    compress_factors = jnp.where((solid_v0 > 5.0) & (solid_v0 < 6.0), 0.645, compress_factors)
-    # 氧化铝 (Al2O3 V0 ~ 25.6): Murnaghan 压缩估计
-    compress_factors = jnp.where((solid_v0 > 20.0) & (solid_v0 < 30.0), 0.92, compress_factors)
     
-    # 计算有效固相体积
-    V_solids_eff = jnp.sum(n_solid * solid_v0 * compress_factors)
-    V_gas_eff = jnp.maximum(V_total - V_solids_eff, 1e-2) 
+    # 自动识别策略 (基于 V0 值段的工程识别):
+    # 碳 (Graphite V0 ~ 5.3)
+    is_carbon = (solid_v0 > 5.0) & (solid_v0 < 6.0)
+    compress_factors = jnp.where(is_carbon, 0.645, compress_factors)
+    
+    # 氧化铝 (Al2O3 V0 ~ 25.6)
+    is_alumina = (solid_v0 > 24.0) & (solid_v0 < 27.0)
+    compress_factors = jnp.where(is_alumina, 1.32, compress_factors)
+    
+    # 计算有效凝聚相体积
+    V_condensed_eff = jnp.sum(n_solid * solid_v0 * compress_factors)
+    V_gas_eff = jnp.maximum(V_total - V_condensed_eff, 1e-2) 
     V_gas_m3 = V_gas_eff * 1e-6
 
     # === 4. 气相自由能 (JCZ3 + Ideal Gas) ===
