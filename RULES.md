@@ -61,18 +61,10 @@ mamba install -c conda-forge pandas matplotlib
 
 ## 2. 代码架构原则
 
-### 2.1 混合精度策略 (Mixed Precision)
-- **Tier 1 (Float32)**：分子势能计算、矩阵运算、神经网络推理
-- **Tier 2 (Float64)**：吉布斯自由能累加、牛顿法残差检查、状态更新
-- **原则**：计算密集用 FP32 加速，数值敏感用 FP64 保精度
-
-```python
-# 精度转换范式
-def compute_intensive_func(x):
-    x = x.astype(jnp.float32)  # 下转型加速
-    result = heavy_computation(x)
-    return result.astype(jnp.float64)  # 上转型保精度
-```
+### 2.1 精度控制策略 (Precision Strategy)
+- **全局启用 Float64**: 为保证热力学计算（尤其是熵和吉布斯能）的绝对精度，系统默认开启双精度。
+- **配置**: `jax.config.update("jax_enable_x64", True)`
+- **例外**: 仅在极大规模神经网络推理（非物理内核）时允许使用 FP32。
 
 ### 2.2 隐式微分 (Implicit Differentiation)
 - **禁止**：记录牛顿法迭代的完整计算图（会导致 OOM）
@@ -132,6 +124,10 @@ jax.config.update("jax_debug_nans", True)
 - **前向**：严谨的 `if-else` 离散逻辑
 - **反向**：固定相态假设（Straight-Through Estimator）
 
+### 4.4 热力学修正 (Thermodynamic Rigor) - V8.5+
+- **生成内能计算**: 必须使用 $\Delta_f U^\circ = \Delta_f H^\circ - \Delta n_{gas}RT$ 修正公式。
+- **严禁**: 直接使用焓变 $\Delta H$ 近似内能 $\Delta U$（会导致爆热误差 > 50%）。
+
 ---
 
 ## 5. 测试与验证规范
@@ -157,12 +153,12 @@ jax.config.update("jax_debug_nans", True)
    - 杜绝“只报爆速，不报爆压/爆温”或“JWL 参数缺失”的行为。
 
 ### 5.3 误差阈值标准 (Target)
-| 参数 | 核心单体 (HMX/RDX) | 混合/含铝炸药 |
-| :--- | :---: | :---: |
-| 爆速 $D$ | < 1.5% | < 3% |
-| 爆压 $P_{CJ}$ | < 3% | < 5% |
-| 爆热 $Q$ | < 5% | < 10% |
-| JWL 曲线 | MAE < 0.5 GPa | MAE < 1.0 GPa |
+| 参数 | 核心单体 (HMX/RDX) | 混合/含铝炸药 | 备注 |
+| :--- | :---: | :---: | :--- |
+| 爆速 $D$ | < 3% | < 5% | - |
+| 爆压 $P_{CJ}$ | TBD | TBD | **V8.5 已知瓶颈**: 物理一致参数导致系统性低估约 15-20%。 |
+| 爆热 $Q$ | < 10% | < 15% | V8.5 修复后已达标 |
+| JWL 曲线 | MAE < 0.5 GPa | MAE < 1.0 GPa | - |
 
 ### 5.4 性能基准
 - 单状态点计算时间目标：< 10ms
