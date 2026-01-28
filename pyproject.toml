@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdu"
+version = "0.1.0"
+description = "PyDetonation-Ultra: 基于 JAX 的可微分爆轰物理计算框架"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "PDU Development Team"}
+]
+keywords = ["detonation", "explosives", "thermodynamics", "jax", "differentiable"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+dependencies = [
+    "jax>=0.4.0",
+    "jaxlib>=0.4.0",
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "optax>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "black",
+    "isort",
+    "mypy",
+]
+viz = [
+    "matplotlib>=3.5.0",
+    "pandas>=1.3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/pdu/PyDetonation-Ultra"
+Documentation = "https://github.com/pdu/PyDetonation-Ultra#readme"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pdu*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_ignores = true

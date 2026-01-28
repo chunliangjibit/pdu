@@ -1,0 +1,185 @@
+"""
+化学平衡求解器模块 (Accelerated Schur-RAND)
+
+基于 Schur Complement 加速的 KKT 求解器，专为 RTX 4060 等 FP32 主力硬件优化。
+API 已重构为直接接受数值矩阵 (A)，避免传递字符串导致的 JAX Tracing 问题。
+"""
+
+import jax
+import jax.numpy as jnp
+from jax import custom_vjp, jit, lax
+from typing import Tuple, NamedTuple, Optional
+
+from pdu.utils.precision import to_fp32, to_fp64, R_GAS
+from pdu.physics.thermo import compute_chemical_potential, compute_gibbs_batch
+from pdu.physics.eos import compute_pressure_jcz3, compute_chemical_potential_jcz3
+
+# ==============================================================================
+# Helper for matrix building (User utility)
+# ==============================================================================
+def build_stoichiometry_matrix(species_list, elements):
+    species_elements = {
+        'N2': {'N': 2}, 'CO2': {'C': 1, 'O': 2}, 'H2O': {'H': 2, 'O': 1},
+        'CO': {'C': 1, 'O': 1}, 'H2': {'H': 2}, 'O2': {'O': 2},
+        'NO': {'N': 1, 'O': 1}, 'OH': {'O': 1, 'H': 1},
+        'NH3': {'N': 1, 'H': 3}, 'CH4': {'C': 1, 'H': 4},
+        'C_graphite': {'C': 1}, 'Al2O3': {'Al': 2, 'O': 3},
+        'Al': {'Al': 1}
+    }
+    n_elem = len(elements)
+    n_spec = len(species_list)
+    A = jnp.zeros((n_elem, n_spec), dtype=jnp.float32)
+    for i, s in enumerate(species_list):
+        comp = species_elements.get(s, {})
+        for j, e in enumerate(elements):
+            A = A.at[j, i].set(float(comp.get(e, 0)))
+    return A
+
+# ==============================================================================
+# 核心算法：基于 Schur 补的 KKT 求解器
+# ==============================================================================
+
+@jit
+def solve_kkt_schur(
+    n: jnp.ndarray,
+    mu_total: jnp.ndarray,
+    A: jnp.ndarray,
+    residual_elem: jnp.ndarray,
+    active_mask: jnp.ndarray,
+    T: float
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Schur Complement KKT Solver"""
+    n_safe = jnp.maximum(n, 1e-20)
+    H_inv_diag = to_fp32(n_safe / (R_GAS * T)) * active_mask
+    
+    M = (A * H_inv_diag) @ A.T
+    
+    grad_G = to_fp32(mu_total)
+    rhs = to_fp64(residual_elem) - to_fp64(A @ (H_inv_diag * grad_G))
+    
+    M_64 = to_fp64(M)
+    M_reg = M_64 + 1e-9 * jnp.eye(M.shape[0], dtype=jnp.float64)
+    lambda_new = jax.scipy.linalg.solve(M_reg, rhs)
+    
+    grad_total = grad_G + to_fp32(A.T @ lambda_new)
+    dn = -H_inv_diag * grad_total
+    
+    return dn, lambda_new
+
+
+@jit
+def _equilibrium_loop_body(state, params_static):
+    """求解循环体 (V8支持多相)"""
+    n, A, b_elem, coeffs, V, T, active_mask, damping, iter_idx, eos_params = state
+    # eps, r_star, alpha, [solid_mask, solid_v0]
+    eps, r_star, alpha = eos_params[:3]
+    solid_mask = eos_params[3] if len(eos_params) > 3 else None
+    solid_v0 = eos_params[4] if len(eos_params) > 4 else None
+    
+    # 1. 计算化学势 (JCZ3 AutoDiff)
+    mu = compute_chemical_potential_jcz3(n, V, T, coeffs, eps, r_star, alpha, solid_mask, solid_v0)
+    
+    # 2. 计算残差
+    n_64 = to_fp64(n)
+    res_elem = to_fp64(A) @ n_64 - to_fp64(b_elem)
+    
+    # 3. KKT 步
+    dn, lambda_new = solve_kkt_schur(
+        n, mu, A, res_elem, active_mask, T
+    )
+    
+    # 4. 更新
+    def apply_update(ni, dni):
+        factor = jnp.where(dni < 0, 0.9 * ni / (jnp.abs(dni) + 1e-30), 1.0)
+        scale = jnp.minimum(1.0, factor)
+        return ni + damping * scale * dni
+        
+    n_new = apply_update(n, dn)
+    n_new = jnp.maximum(n_new, 1e-20)
+    new_res_norm = jnp.linalg.norm(res_elem)
+    
+    return (n_new, A, b_elem, coeffs, V, T, active_mask, damping, iter_idx + 1, eos_params), new_res_norm
+
+
+def _solve_equilibrium_impl(
+    atom_vec: jnp.ndarray,
+    V: float,
+    T: float,
+    A: jnp.ndarray,
+    coeffs_all: jnp.ndarray,
+    eos_params: tuple
+) -> jnp.ndarray:
+    """求解化学平衡 (Primal Implementation) (V8支持多相)"""
+    n_species = A.shape[1]
+    n_init = jnp.ones(n_species) * (1.0 / n_species)
+    active_mask = jnp.ones(n_species)
+    
+    # Pass eos_params into state
+    init_state = (n_init, A, atom_vec, coeffs_all, V, T, active_mask, 1.0, 0, eos_params)
+    
+    def cond_fn(val):
+        state, res_norm = val
+        iter_idx = state[-2] 
+        return (res_norm > 1e-4) & (iter_idx < 300)
+    
+    def body_fn(val):
+        state, _ = val
+        new_state, new_res = _equilibrium_loop_body(state, None)
+        return new_state, new_res
+        
+    final_val = lax.while_loop(cond_fn, body_fn, (init_state, 10.0))
+    n_final = final_val[0][0]
+    return n_final
+
+
+def solve_equilibrium_fwd(atom_vec, V, T, A, coeffs_all, eos_params):
+    n_star = _solve_equilibrium_impl(atom_vec, V, T, A, coeffs_all, eos_params)
+    return n_star, (n_star, atom_vec, V, T, A, coeffs_all, eos_params)
+
+def solve_equilibrium_bwd(res, g_n):
+    n_star, atom_vec, V, T, A, coeffs, eos_params = res
+    eps, r_s, alpha = eos_params[:3]
+    solid_mask = eos_params[3] if len(eos_params) > 3 else None
+    solid_v0 = eos_params[4] if len(eos_params) > 4 else None
+    
+    from pdu.physics.eos import compute_total_helmholtz_energy
+    H_exact = jax.hessian(compute_total_helmholtz_energy, argnums=0)(
+        n_star, V, T, coeffs, eps, r_s, alpha, solid_mask, solid_v0
+    )
+    
+    H_inv = jax.scipy.linalg.inv(H_exact + 1e-6 * jnp.eye(H_exact.shape[0]))
+    M = A @ H_inv @ A.T
+    M_reg = to_fp64(M) + 1e-9 * jnp.eye(M.shape[0], dtype=jnp.float64)
+    rhs_schur = A @ (H_inv @ g_n)
+    lambda_adj = jax.scipy.linalg.solve(M_reg, to_fp64(rhs_schur))
+    
+    term = g_n - A.T @ lambda_adj
+    z_n = H_inv @ term
+    
+    grad_atom = lambda_adj
+    grad_V = None 
+    grad_T = None 
+    grad_A = None 
+    grad_coeffs = None
+    
+    from pdu.physics.eos import compute_chemical_potential_jcz3
+    
+    # Sensitivity w.r.t EOS Params (eps, r, alpha, solid_mask, solid_v0)
+    # We maintain the structure of eos_params
+    def computed_mu_for_diff(*params):
+        # params matches eos_params structure
+        e, r, a = params[:3]
+        sm = params[3] if len(params) > 3 else None
+        sv = params[4] if len(params) > 4 else None
+        return compute_chemical_potential_jcz3(n_star, V, T, coeffs, e, r, a, sm, sv)
+    
+    _, vjp_fun = jax.vjp(computed_mu_for_diff, *eos_params)
+    
+    grad_eos = vjp_fun(-z_n)
+    
+    return grad_atom, grad_V, grad_T, grad_A, grad_coeffs, grad_eos
+
+
+# nondiff_argnums: None now (allow everything to catch gradients)
+solve_equilibrium = custom_vjp(_solve_equilibrium_impl)
+solve_equilibrium.defvjp(solve_equilibrium_fwd, solve_equilibrium_bwd)

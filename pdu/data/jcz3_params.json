@@ -1,0 +1,69 @@
+{
+  "species": {
+    "N2": {
+      "epsilon_over_k": 103.58,
+      "r_star": 5.95,
+      "alpha": 13.6
+    },
+    "H2O": {
+      "epsilon_over_k": 392.07,
+      "r_star": 3.35,
+      "alpha": 13.8
+    },
+    "CO2": {
+      "epsilon_over_k": 246.49,
+      "r_star": 4.85,
+      "alpha": 13.4
+    },
+    "CO": {
+      "epsilon_over_k": 110.27,
+      "r_star": 4.35,
+      "alpha": 13.8
+    },
+    "NO": {
+      "epsilon_over_k": 102.08,
+      "r_star": 5.48,
+      "alpha": 13.57
+    },
+    "CH4": {
+      "epsilon_over_k": 98.65,
+      "r_star": 2.16,
+      "alpha": 13.24
+    },
+    "C_graphite": {
+      "epsilon_over_k": 30.6,
+      "r_star": 4.00,
+      "alpha": 12.0
+    },
+    "H2": {
+      "epsilon_over_k": 36.4,
+      "r_star": 3.34,
+      "alpha": 11.5
+    },
+    "O2": {
+      "epsilon_over_k": 121.1,
+      "r_star": 3.66,
+      "alpha": 13.0
+    },
+    "OH": {
+      "epsilon_over_k": 120.0,
+      "r_star": 3.20,
+      "alpha": 13.0
+    },
+    "NH3": {
+      "epsilon_over_k": 481.0,
+      "r_star": 3.31,
+      "alpha": 14.0
+    },
+    "Al": {
+      "epsilon_over_k": 2000.0,
+      "r_star": 4.50,
+      "alpha": 14.0
+    },
+    "Al2O3": {
+      "epsilon_over_k": 4998.05,
+      "r_star": 3.15,
+      "alpha": 14.1
+    }
+  }
+}

@@ -1,0 +1,197 @@
+{
+    "_metadata": {
+        "description": "Reactant Components Database - High Energy Materials and Binders",
+        "version": "1.0.0",
+        "note": "Reactants are consumed during detonation. Do NOT confuse with products (which need JCZ3 EOS params)."
+    },
+    "explosives": {
+        "HMX": {
+            "name": "Octogen (HMX)",
+            "formula": {
+                "C": 4,
+                "H": 8,
+                "N": 8,
+                "O": 8
+            },
+            "molecular_weight": 296.16,
+            "enthalpy_formation": 75.0,
+            "density": 1.891,
+            "type": "nitramine",
+            "oxygen_balance": -21.6
+        },
+        "RDX": {
+            "name": "Cyclotrimethylenetrinitramine",
+            "formula": {
+                "C": 3,
+                "H": 6,
+                "N": 6,
+                "O": 6
+            },
+            "molecular_weight": 222.12,
+            "enthalpy_formation": 70.0,
+            "density": 1.806,
+            "type": "nitramine",
+            "oxygen_balance": -21.6
+        },
+        "TNT": {
+            "name": "Trinitrotoluene",
+            "formula": {
+                "C": 7,
+                "H": 5,
+                "N": 3,
+                "O": 6
+            },
+            "molecular_weight": 227.13,
+            "enthalpy_formation": -63.0,
+            "density": 1.654,
+            "type": "nitroaromatic",
+            "oxygen_balance": -73.9
+        },
+        "PETN": {
+            "name": "Pentaerythritol tetranitrate",
+            "formula": {
+                "C": 5,
+                "H": 8,
+                "N": 4,
+                "O": 12
+            },
+            "molecular_weight": 316.14,
+            "enthalpy_formation": -539.0,
+            "density": 1.76,
+            "type": "nitrate_ester"
+        },
+        "NM": {
+            "name": "Nitromethane",
+            "formula": {
+                "C": 1,
+                "H": 3,
+                "N": 1,
+                "O": 2
+            },
+            "molecular_weight": 61.04,
+            "enthalpy_formation": -113.0,
+            "density": 1.128,
+            "type": "liquid_monopropellant"
+        }
+    },
+    "binders": {
+        "HTPB_Cured": {
+            "name": "Hydroxyl-Terminated Polybutadiene (Cured System)",
+            "type": "reactant_only",
+            "description": "R45M Cured HTPB with IPDI crosslinker and DOA plasticizer",
+            "composition_model": "empirical_average",
+            "formula": {
+                "C": 7.33,
+                "H": 10.98,
+                "N": 0.03,
+                "O": 0.11
+            },
+            "molecular_weight_effective": 100.0,
+            "enthalpy_formation": -126.0,
+            "density": 0.93,
+            "components": {
+                "HTPB_polymer": "73.46%",
+                "DOA_plasticizer": "7.35%",
+                "IPDI_curative": "0.95%",
+                "additives": "0.37%"
+            },
+            "notes": "This is NOT a product species. Only used for reactant energy calculation."
+        },
+        "Estane": {
+            "name": "Estane 5703 (Polyurethane binder)",
+            "formula": {
+                "C": 6.5,
+                "H": 9.2,
+                "N": 0.8,
+                "O": 2.1
+            },
+            "molecular_weight_effective": 110.0,
+            "enthalpy_formation": -380.0,
+            "density": 1.18,
+            "type": "reactant_only"
+        }
+    },
+    "metals": {
+        "Al": {
+            "name": "Aluminum (powder)",
+            "formula": {
+                "Al": 1
+            },
+            "molecular_weight": 26.982,
+            "enthalpy_formation": 0.0,
+            "density": 2.70,
+            "oxidation_enthalpy": -1675.7,
+            "notes": "Hf_Al2O3 = -1675.7 kJ/mol"
+        }
+    },
+    "mixtures": {
+        "Comp_B": {
+            "name": "Composition B (60/40 RDX/TNT)",
+            "mass_fractions": {
+                "RDX": 0.60,
+                "TNT": 0.40
+            },
+            "effective_formula": {
+                "C": 4.2,
+                "H": 5.6,
+                "N": 4.8,
+                "O": 6.0
+            },
+            "effective_Hf": 20.0,
+            "effective_Mw": 224.6,
+            "density": 1.717
+        },
+        "Octol_75_25": {
+            "name": "Octol (75/25 HMX/TNT)",
+            "mass_fractions": {
+                "HMX": 0.75,
+                "TNT": 0.25
+            },
+            "effective_formula": {
+                "C": 4.75,
+                "H": 7.25,
+                "N": 6.75,
+                "O": 7.50
+            },
+            "effective_Hf": 40.0,
+            "effective_Mw": 278.5,
+            "density": 1.821
+        },
+        "Tritonal": {
+            "name": "Tritonal (80/20 TNT/Al)",
+            "mass_fractions": {
+                "TNT": 0.80,
+                "Al": 0.20
+            },
+            "effective_formula": {
+                "C": 5.6,
+                "H": 4.0,
+                "N": 2.4,
+                "O": 4.8,
+                "Al": 1.0
+            },
+            "effective_Hf": -120.0,
+            "effective_Mw": 208.0,
+            "density": 1.72
+        },
+        "PBXN_109": {
+            "name": "PBXN-109 (64% RDX, 20% Al, 16% HTPB)",
+            "mass_fractions": {
+                "RDX": 0.64,
+                "Al": 0.20,
+                "HTPB_Cured": 0.16
+            },
+            "effective_formula": {
+                "C": 3.1,
+                "H": 5.6,
+                "N": 3.85,
+                "O": 3.85,
+                "Al": 1.48
+            },
+            "effective_Hf": -185.0,
+            "effective_Mw": 185.0,
+            "density": 1.68,
+            "notes": "Corrected with HTPB binder contribution"
+        }
+    }
+}

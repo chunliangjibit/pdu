@@ -1,0 +1,159 @@
+{
+    "_metadata": {
+        "description": "Experimental JWL Parameters Database",
+        "sources": [
+            "LLNL Explosives Handbook (Dobratz & Crawford, 1985)",
+            "AIP Conference Proceedings (PBXN-109 cylinder test)",
+            "Fickett & Davis, Detonation (1979)"
+        ],
+        "units": {
+            "A": "GPa",
+            "B": "GPa",
+            "R1": "dimensionless",
+            "R2": "dimensionless",
+            "omega": "dimensionless",
+            "E0": "GPa (specific internal energy density)",
+            "rho0": "g/cm³",
+            "D": "m/s",
+            "P_CJ": "GPa"
+        },
+        "notes": "JWL EOS: P = A*(1-ω/(R1*V))*exp(-R1*V) + B*(1-ω/(R2*V))*exp(-R2*V) + ω*E0/V"
+    },
+    "explosives": {
+        "HMX": {
+            "name": "Octogen (HMX)",
+            "rho0": 1.891,
+            "D_exp": 9110,
+            "P_CJ_exp": 39.0,
+            "JWL": {
+                "A": 778.0,
+                "B": 7.07,
+                "R1": 4.20,
+                "R2": 1.00,
+                "omega": 0.30,
+                "E0": 10.5
+            },
+            "source": "LLNL Handbook Table 7-4"
+        },
+        "RDX": {
+            "name": "Cyclotrimethylenetrinitramine (RDX)",
+            "rho0": 1.806,
+            "D_exp": 8750,
+            "P_CJ_exp": 34.0,
+            "JWL": {
+                "A": 778.0,
+                "B": 7.07,
+                "R1": 4.50,
+                "R2": 1.40,
+                "omega": 0.25,
+                "E0": 9.5
+            },
+            "source": "LLNL Handbook Table 7-4"
+        },
+        "TNT": {
+            "name": "Trinitrotoluene (TNT)",
+            "rho0": 1.654,
+            "D_exp": 6930,
+            "P_CJ_exp": 21.0,
+            "JWL": {
+                "A": 374.0,
+                "B": 3.23,
+                "R1": 4.15,
+                "R2": 0.90,
+                "omega": 0.30,
+                "E0": 6.0
+            },
+            "source": "LLNL Handbook Table 7-4"
+        },
+        "PETN": {
+            "name": "Pentaerythritol tetranitrate (PETN)",
+            "rho0": 1.76,
+            "D_exp": 8260,
+            "P_CJ_exp": 33.5,
+            "JWL": {
+                "A": 617.0,
+                "B": 16.9,
+                "R1": 4.40,
+                "R2": 1.20,
+                "omega": 0.25,
+                "E0": 10.0
+            },
+            "source": "Literature (Mader, 1998)"
+        },
+        "Comp_B": {
+            "name": "Composition B (60/40 RDX/TNT)",
+            "rho0": 1.717,
+            "D_exp": 7980,
+            "P_CJ_exp": 29.5,
+            "JWL": {
+                "A": 524.0,
+                "B": 7.68,
+                "R1": 4.20,
+                "R2": 1.10,
+                "omega": 0.34,
+                "E0": 8.5
+            },
+            "source": "LLNL Handbook (estimated)"
+        },
+        "Octol_75_25": {
+            "name": "Octol 75/25 (HMX/TNT)",
+            "rho0": 1.821,
+            "D_exp": 8480,
+            "P_CJ_exp": 34.8,
+            "JWL": {
+                "A": 648.0,
+                "B": 12.95,
+                "R1": 4.50,
+                "R2": 1.40,
+                "omega": 0.28,
+                "E0": 10.0
+            },
+            "source": "Estimated from mixing rules"
+        },
+        "Tritonal": {
+            "name": "Tritonal (80/20 TNT/Al)",
+            "rho0": 1.72,
+            "D_exp": 6700,
+            "P_CJ_exp": 25.0,
+            "JWL": {
+                "A": 400.0,
+                "B": 4.0,
+                "R1": 4.50,
+                "R2": 1.20,
+                "omega": 0.35,
+                "E0": 7.5
+            },
+            "source": "Estimated (aluminized)"
+        },
+        "PBXN_109": {
+            "name": "PBXN-109 (Aluminized HMX-based)",
+            "rho0": 1.68,
+            "D_exp": 8050,
+            "P_CJ_exp": 30.0,
+            "JWL": {
+                "A": 1157.0,
+                "B": 19.4,
+                "R1": 5.70,
+                "R2": 1.242,
+                "omega": 0.199,
+                "E0": 7.0
+            },
+            "source": "AIP Conf. Proc. (cylinder test fit)"
+        },
+        "NM": {
+            "name": "Nitromethane (liquid)",
+            "rho0": 1.128,
+            "D_exp": 6260,
+            "P_CJ_exp": 12.6,
+            "JWL": {
+                "A": 488.0,
+                "B": 6.36,
+                "R1": 5.00,
+                "R2": 1.50,
+                "omega": 0.38,
+                "E0": 5.2
+            },
+            "source": "Estimated from literature"
+        }
+    }
+}
