@@ -126,9 +126,28 @@ def run_verification():
         except Exception as e:
             print(f"  FAILED: {e}\n")
 
-    # Generate Report Table
+    # Generate Markdown Report
+    report_path = Path('docs/v8_performance_report.md')
+    with report_path.open('w', encoding='utf-8') as f:
+        f.write("# PyDetonation-Ultra V8.4 性能验证报告 (最终物理修正版)\n\n")
+        f.write("## 1. 爆轰基础性能 (D, P)\n\n")
+        f.write("| 炸药名称 | 种类 | 装药密度 | 实验爆速 | 预测爆速 | 误差 | 实验爆压 | 预测爆压 | 误差 |\n")
+        f.write("| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n")
+        for d in report_data:
+            f.write(f"| **{d['name']}** | {d['type']} | {d['rho0']} | {d['exp_D']} | {d['pred_D']:.0f} | {d['err_D']:+.2f}% | {d['exp_P']} | {d['pred_P']:.2f} | {d['err_P']:+.2f}% |\n")
+        
+        f.write("\n## 2. JWL 状态方程拟合参数\n\n")
+        f.write("| 炸药名称 | A (GPa) | B (GPa) | R1 | R2 | omega | 拟合性质 |\n")
+        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :--- |\n")
+        for d in report_data:
+            j = d['jwl']
+            f.write(f"| **{d['name']}** | {j['A']:.1f} | {j['B']:.2f} | {j['R1']:.2f} | {j['R2']:.2f} | {j['omega']:.4f} | 等熵锚定 |\n")
+
+    # Generate JSON for archival
     with open('verification_results.json', 'w') as f:
         json.dump(report_data, f, indent=2)
+    
+    print(f"\nReport generated: {report_path}")
 
 if __name__ == "__main__":
     run_verification()
