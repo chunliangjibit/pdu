@@ -39,6 +39,9 @@ class DetonationResult(NamedTuple):
     
     # 产物信息
     products: Dict[str, float]  # 产物摩尔分数
+    
+    # V10.4 Add: Miller Degree
+    miller_degree: float = 0.0
 
 
 @dataclass
@@ -155,7 +158,16 @@ def detonation_forward(
     from pdu.physics.sensitivity import estimate_impact_sensitivity, estimate_sensitivity_class
     from pdu.calibration.differentiable_cj_enhanced import predict_cj_with_isentrope
     from pdu.physics.jwl import fit_jwl_from_isentrope
-    from pdu.physics.kinetics import compute_miller_al_reaction_degree, compute_sj_carbon_energy_delay
+    # V10.3 Upgrade: Import Miller V3 and V10.4 V4 and V10.5 V5
+    from pdu.physics.kinetics import (
+        compute_miller_al_reaction_degree_v3,
+        compute_miller_al_reaction_degree_v4, # V10.4 Shear Stripping
+        compute_miller_al_reaction_degree_v5, # V10.5 Thermal Lag
+        compute_miller_al_reaction_degree,  # V10.1 compatibility
+        compute_sj_carbon_energy_delay,
+        compute_freeze_out_temperature,
+        compute_effective_heat_release_factor
+    )
     
     # V8.7 Upgrade: Dynamic Species List for Two-Step Calculation
     # V10.1: Reverting gaseous Al oxides for stability
@@ -179,6 +191,8 @@ def detonation_forward(
     if 'Al' in components and not reaction_degree:
         is_auto_miller = True
         if verbose: print("V10.1 INFO: Aluminum detected without manual degree. Enabling Miller Auto-Kinetics.")
+    
+    miller_degree = 0.0 # Default
     
     if reaction_degree and 'Al' in reaction_degree:
         is_partial_al = True
@@ -365,9 +379,13 @@ def detonation_forward(
     D, P_cj, T_cj, V_cj, iso_V, iso_P, n_cj = D_raw, P_cj_raw, T_cj_raw, V_cj_raw, iso_V_raw, iso_P_raw, n_cj_raw
     
     # Step 3.1: Apply Miller Kinetics if enabled (Iterative Refinement)
+    # V10.3 Upgrade: Using Miller-PDU V3 with oxide cap and adaptive burn law
     if is_auto_miller:
-        miller_degree = compute_miller_al_reaction_degree(float(P_cj), float(T_cj))
-        if verbose: print(f"V10.1 Miller Feedback: Al Reaction Degree = {miller_degree:.3f} (P={float(P_cj):.1f} GPa)")
+        # V10.5 Upgrade: Use V5 model with Thermal Lag (P0-4)
+        miller_degree = compute_miller_al_reaction_degree_v5(float(P_cj), float(T_cj))
+        if verbose: 
+            print(f"V10.5 Miller-PDU V5 (Thermal Lag): Al Reaction Degree = {miller_degree:.3f}")
+            print(f"   (P={float(P_cj):.1f} GPa, T={float(T_cj):.0f} K)")
         
         # Pass 2: Re-run with the physically derived degree
         idx_Al = ELEMENT_LIST.index('Al')
@@ -449,9 +467,26 @@ def detonation_forward(
     Uf_Al = Hf_Al_Solid # solid
     
     if al_is_reactive:
-        # 假设完全形成 Al2O3 (Standard Q Calculation)
-        mol_Al2O3 = atom_vec[idx_Al] / 2.0 if idx_Al >= 0 else 0.0
-        mol_Al_Inert = 0.0
+        # V10.4 Upgrade (P0-2): 冻结温度截止修正
+        # 即使铝粉完全反应，如果 T < T_freeze，其能量也不能计入有效爆热
+        # 典型 T_freeze = 1650 K
+        
+        # 1. 计算理论最大生成量
+        mol_Al2O3_max = atom_vec[idx_Al] / 2.0 if idx_Al >= 0 else 0.0
+        
+        # 2. 计算有效释放系数
+        if idx_Al >= 0:
+            T_freeze = compute_freeze_out_temperature(float(P_cj))
+            eta_release = compute_effective_heat_release_factor(float(T_cj), T_freeze)
+            if verbose: print(f"V10.4 Freeze-Out: T_freeze={T_freeze:.0f}K, eta={eta_release:.3f}")
+        else:
+            eta_release = 1.0
+            
+        # 3. 修正 Al2O3 生成量 (能量意义上)
+        mol_Al2O3 = mol_Al2O3_max * eta_release
+        
+        # 4. 剩余的 Al 视为惰性 (未完全氧化或能量冻结)
+        mol_Al_Inert = (mol_Al2O3_max - mol_Al2O3) * 2.0
     else:
         # V8.7: Al 不反应，保持单质形态
         mol_Al2O3 = 0.0
@@ -510,7 +545,8 @@ def detonation_forward(
         jwl_R2=float(jwl.R2),
         jwl_omega=float(jwl.omega),
         jwl_mse=float(jwl.fit_mse),
-        products={'N2': 0.35, 'H2O': 0.25, 'CO2': 0.20, 'CO': 0.15, 'C_graphite': 0.05} # 临时占位，以后可从 Equilibrium 提取
+        products={'N2': 0.35, 'H2O': 0.25, 'CO2': 0.20, 'CO': 0.15, 'C_graphite': 0.05}, # 临时占位
+        miller_degree=float(miller_degree)
     )
 
 

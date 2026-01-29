@@ -218,6 +218,111 @@ def fit_jwl_from_isentrope(
     if exp_priors:
         ep = exp_priors
         x0 = [ep['A'], ep['B'], ep['R1'], ep['R2'], ep['omega'], 1.0]
+    
+    # V10.4 P0-3: CJ Anchor Method (Dimensionality Reduction)
+    if method == 'CJ_ANCHOR':
+        from pdu.calibration.pso import PSOOptimizer
+        print(f"[V10.4 Anchor] Running CJ-Anchored Optimization (3D Search)...")
+        
+        # Calculate Targets
+        target_E = constraint_total_energy if constraint_total_energy is not None else (E0 * 1000.0)
+        
+        # Calculate Slope at CJ from Gamma
+        # dP/dV = -Gamma * P / V
+        slope_cj = -gamma_cj_target * P_cj / V_cj_rel
+        
+        def anchor_obj(p):
+            # p: [R1, R2, w]
+            R1, R2, w = p
+            
+            # 1. Solve Linear System
+            A, B, C = solve_jwl_linear_params(R1, R2, w, V_cj_rel, P_cj, slope_cj, target_E)
+            
+            # 2. Hard Physical Constraints (Vectorized)
+            # Check for NaN (Singular matrix)
+            is_nan = jnp.isnan(A) | jnp.isnan(B) | jnp.isnan(C)
+            
+            # Non-negativity
+            penalty_neg = jnp.where(A < 0, 1e8 + jnp.abs(A)*100, 0.0) + \
+                          jnp.where(B < 0, 1e8 + jnp.abs(B)*100, 0.0) + \
+                          jnp.where(C < 0, 1e8 + jnp.abs(C)*100, 0.0)
+            
+            # R1 > R2 ordering
+            penalty_order = jnp.where(R1 < R2 + 0.1, 1e9, 0.0)
+            
+            # Combine penalties
+            penalty_constraints = jnp.where(is_nan, 1e10, penalty_neg + penalty_order)
+            
+            # Logic: If constraints violated, return penalty. Else compute MSE.
+            # But we must compute MSE anyway to keep shapes static, or use where.
+            
+            params_full = jnp.array([A, B, R1, R2, w, C])
+            val_fit = objective(params_full)
+            
+            return jnp.where(penalty_constraints > 0, penalty_constraints, val_fit)
+            
+        # 3D Search Space: R1, R2, w
+        lb = jnp.array([1.5, 0.5, 0.1])
+        ub = jnp.array([12.0, 4.0, 1.0])
+        
+        pso = PSOOptimizer(anchor_obj, lb, ub, num_particles=50) # Faster
+        best_x_pso, best_f_pso = pso.optimize(num_iterations=100)
+        
+        R1, R2, w = best_x_pso
+        A, B, C = solve_jwl_linear_params(R1, R2, w, V_cj_rel, P_cj, slope_cj, target_E)
+        
+        # Final refinement? No, analytical is exact.
+        # Just return results.
+        print(f"[V10.4 Anchor] Result: A={A:.1f}, B={B:.1f}, w={w:.3f}")
+        
+        # Calculate final MSE
+        P_final = A * np.exp(-R1 * V_rel_array) + \
+                 B * np.exp(-R2 * V_rel_array) + \
+                 C / (V_rel_array**(1.0 + w))
+        final_mse = np.mean((np.log(np.maximum(P_final, 1e-6)) - y_log)**2)
+        
+        return JWLParams(A=float(A), B=float(B), R1=float(R1), R2=float(R2), omega=float(w), E0=float(E0), fit_mse=float(final_mse))
+
+        return JWLParams(A=float(A), B=float(B), R1=float(R1), R2=float(R2), omega=float(w), E0=float(E0), fit_mse=float(final_mse))
+
+    # V10.5 P0-5: Relaxed Penalty Method
+    if method == 'RELAXED_PENALTY':
+        from pdu.calibration.pso import PSOOptimizer
+        print(f"[V10.5 Relaxed] Running 5-Param Penalty Optimization...")
+        
+        target_E = constraint_total_energy if constraint_total_energy is not None else (E0 * 1000.0)
+        
+        def penalty_obj(p):
+            # p: [A, B, R1, R2, w]
+            return loss_penalty_jwl(p, V_rel_array, P_array, V_cj_rel, P_cj, target_E)
+            
+        # Bounds: A, B > 0 enforced by penalty, but bounds help PSO
+        lb = jnp.array([10.0, 0.1, 1.5, 0.2, 0.05])
+        ub = jnp.array([500000.0, 500.0, 15.0, 5.0, 1.2]) # High A bound for Comp B/PBXN
+        
+        pso = PSOOptimizer(penalty_obj, lb, ub, num_particles=80)
+        best_x, best_f = pso.optimize(num_iterations=150)
+        
+        A, B, R1, R2, w = best_x
+        
+        # Derive C for final output
+        term1 = (A / R1) * jnp.exp(-R1)
+        term2 = (B / R2) * jnp.exp(-R2)
+        C = w * (target_E - term1 - term2)
+        
+        # Check Final Quality
+        print(f"[V10.5 Relaxed] Result: A={A:.1f}, B={B:.2f}, R1={R1:.2f}, R2={R2:.2f}, w={w:.3f}")
+        if B < 0.1:
+            print("WARNING: B is dangerously low or negative despite penalty!")
+            
+        # Calculate final MSE
+        P_final = A * np.exp(-R1 * V_rel_array) + \
+                 B * np.exp(-R2 * V_rel_array) + \
+                 C / (V_rel_array**(1.0 + w))
+        final_mse = np.mean((np.log(np.maximum(P_final, 1e-6)) - y_log)**2)
+        
+        return JWLParams(A=float(A), B=float(B), R1=float(R1), R2=float(R2), omega=float(w), E0=float(E0), fit_mse=float(final_mse))
+
     if method == 'PSO':
         from pdu.calibration.pso import PSOOptimizer
         print(f"[V10 PSO] Running Global Optimization for JWL fitting...")
@@ -246,5 +351,107 @@ def fit_jwl_from_isentrope(
     final_mse = np.mean((np.log(np.maximum(P_final, 1e-6)) - y_log)**2)
     
     return JWLParams(A=float(A), B=float(B), R1=float(R1), R2=float(R2), omega=float(w), E0=float(E0), fit_mse=float(final_mse))
+
+
+# ==============================================================================
+# V10.4 新增: CJ 锚定求解器 (P0-3 改进)
+# ==============================================================================
+
+def solve_jwl_linear_params(R1, R2, w, V_cj, P_cj, Slope_cj, E_cj):
+    """
+    解析求解 JWL 线性参数 A, B, C (V10.4)
+    
+    构建线性方程组 M * [A, B, C]^T = [P, Slope, E]^T
+    
+    Returns:
+        A, B, C (all JAX scalars)
+    """
+    # 避免数值溢出 (Clamp instead of return None)
+    # If overflow, matrix values dominate and result likely garbage/NaN, handled by caller
+    
+    term1 = jnp.exp(-R1 * V_cj)
+    term2 = jnp.exp(-R2 * V_cj)
+    term3_p = V_cj ** -(1.0 + w)
+    term3_s = V_cj ** -(2.0 + w)
+    term3_e = V_cj ** -w
+    
+    # 1. 压力方程 P(V) = A*t1 + B*t2 + C*t3_p
+    row1 = [term1, term2, term3_p]
+    
+    # 2. 斜率方程 P'(V) = -A*R1*t1 - B*R2*t2 - C*(1+w)*t3_s
+    row2 = [-R1 * term1, -R2 * term2, -(1.0 + w) * term3_s]
+    
+    # 3. 能量方程 E_int = A/R1*t1 + B/R2*t2 + C/w*t3_e
+    # 注意: E_int 是从 V_cj 到无穷远的积分 (expansion work)
+    # E_cj = internal energy at CJ state relative to expansion limit
+    row3 = [term1 / R1, term2 / R2, term3_e / w]
+    
+    M = jnp.array([row1, row2, row3])
+    y = jnp.array([P_cj, Slope_cj, E_cj])
+    
+    # 求解
+    # remove try-except, rely on JAX returning NaNs for singular matrix
+    sol = jnp.linalg.solve(M, y)
+    return sol[0], sol[1], sol[2]
+
+
+# ==============================================================================
+# V10.5 新增: Relaxed Penalty Anchor (P0-5 改进)
+# ==============================================================================
+
+def loss_penalty_jwl(
+    params, 
+    V_data, P_data, 
+    V_cj, P_cj, 
+    E_target
+):
+    """
+    V10.5 Penalty Loss Function
+    Objective = LogMSE + Lambda_CJ*(P-P_cj)^2 + Lambda_E*(E-E0)^2 + Barriers
+    
+    Allows P_cj to deviate slightly to save B > 0.
+    """
+    A, B, R1, R2, w = params
+    
+    # 1. Prediction on Data
+    # P_pred = A e^(-R1 V) + B e^(-R2 V) + w E(V) / V ??
+    # Wait, for fitting we usually assume Isentrope form P_s(V) directly.
+    # P_s = A e^(-R1 V) + B e^(-R2 V) + C V^-(1+w)
+    # But usually C is derived from E0 and A,B,w for consistency?
+    # Or optimize C as free parameter then punish energy mismatch?
+    # Standard: E_integral from V0 to inf = E_target
+    # E_int = A/R1 exp(-R1) + B/R2 exp(-R2) + C/w * 1^(-w)  (assuming V0=1)
+    # => C = w * (E_target - A/R1 e^-R1 - B/R2 e^-R2)
+    # This enforces Energy Constraint exactly if we derive C.
+    
+    term1 = (A / R1) * jnp.exp(-R1)
+    term2 = (B / R2) * jnp.exp(-R2)
+    # E_target = term1 + term2 + C/w
+    C = w * (E_target - term1 - term2)
+    
+    # Check C > 0
+    barrier_C = jnp.where(C < 0, 1e8 + jnp.abs(C)*1000, 0.0)
+    
+    # 2. Fit Error
+    P_pred = A * jnp.exp(-R1 * V_data) + B * jnp.exp(-R2 * V_data) + C / (V_data**(1.0+w))
+    log_err = jnp.log(jnp.maximum(P_pred, 1e-6)) - jnp.log(jnp.maximum(P_data, 1e-4))
+    mse = jnp.mean(log_err**2) * 50.0
+    
+    # 3. CJ Anchor Penalty (Relaxed)
+    P_at_cj = A * jnp.exp(-R1 * V_cj) + B * jnp.exp(-R2 * V_cj) + C / (V_cj**(1.0+w))
+    # Allow 5% error without heavy penalty, then scale up
+    rel_err_cj = (P_at_cj - P_cj) / P_cj
+    # penalty = 0 if |err| < 0.05 else large
+    # Smooth penalty: 100 * err^2
+    penalty_cj = 1000.0 * rel_err_cj**2
+    
+    # 4. Physical Barriers (B > 0 is critical)
+    barrier_A = jnp.where(A < 1.0, 1e8, 0.0) # A must be significant
+    barrier_B = jnp.where(B < 0.1, 1e9 + jnp.abs(B)*1e5, 0.0) # STRICT B > 0
+    barrier_R = jnp.where(R1 < R2 + 0.5, 1e8, 0.0)
+    
+    return mse + penalty_cj + barrier_A + barrier_B + barrier_R + barrier_C
+
+
 
 
