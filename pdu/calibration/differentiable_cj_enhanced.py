@@ -36,9 +36,10 @@ def predict_cj_with_isentrope(
     n_isentrope_points: int = 30,
     solid_mask: Optional[jnp.ndarray] = None,
     solid_v0: Optional[jnp.ndarray] = None,
-    n_fixed_inert: Optional[float] = 0.0,    # V9: Moles of fixed inert solid
-    v0_fixed_inert: Optional[float] = 10.0,  # V9: Molar volume of fixed inert
-    e_fixed_inert: Optional[float] = 0.0     # V9: Internal energy of fixed inert
+    n_fixed_inert: Optional[float] = 0.0,
+    v0_fixed_inert: Optional[float] = 10.0,
+    e_fixed_inert: Optional[float] = 0.0,
+    r_star_rho_corr: float = 0.0
 ) -> tuple:
     """
     Enhanced CJ solver (V8 Multi-Phase Version + V9 Partial Reaction).
@@ -52,7 +53,7 @@ def predict_cj_with_isentrope(
     # Eos params tuple for equilibrium
     # V10: Extended tuple with Ree lambda parameter
     eos_params = (eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, 
-                  n_fixed_inert, v0_fixed_inert, e_fixed_inert)
+                  n_fixed_inert, v0_fixed_inert, e_fixed_inert, r_star_rho_corr)
     
     # =========================================================================
     # Step 1: Find CJ Point
@@ -69,10 +70,11 @@ def predict_cj_with_isentrope(
             t_lo, t_hi = bounds
             t_mid = (t_lo + t_hi) / 2.0
             
+            
             n_eq = solve_equilibrium(atom_vec, V_test, t_mid, A_matrix, coeffs_all, eos_params)
             
-            E = compute_internal_energy_jcz3(n_eq, V_test, t_mid, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert)
-            P = compute_pressure_jcz3(n_eq, V_test, t_mid, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert)
+            E = compute_internal_energy_jcz3(n_eq, V_test, t_mid, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert, r_star_rho_corr)
+            P = compute_pressure_jcz3(n_eq, V_test, t_mid, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert, r_star_rho_corr)
             
             dV = (V0 - V_test) * 1e-6
             hug_err = (E - E0) - 0.5 * P * dV
@@ -84,8 +86,9 @@ def predict_cj_with_isentrope(
         t_bounds = jax.lax.fori_loop(0, 18, bisect_step, (T_min, T_max))
         T_hug = (t_bounds[0] + t_bounds[1]) / 2.0
         
+        
         n_eq = solve_equilibrium(atom_vec, V_test, T_hug, A_matrix, coeffs_all, eos_params)
-        P_pa = compute_pressure_jcz3(n_eq, V_test, T_hug, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert)
+        P_pa = compute_pressure_jcz3(n_eq, V_test, T_hug, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert, r_star_rho_corr)
         
         D_sq = P_pa / jnp.maximum(rho0 * (1.0 - vr), 1e-6)
         D = jnp.sqrt(jnp.maximum(D_sq, 0.0))
@@ -106,10 +109,8 @@ def predict_cj_with_isentrope(
     n_cj = n_grid[cj_idx]
     
     # =========================================================================
-    # Step 2: Full Isentrope Expansion (S = S_cj)
-    # =========================================================================
     
-    S_cj = compute_entropy_consistent(n_cj, V_cj, T_cj, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert)
+    S_cj = compute_entropy_consistent(n_cj, V_cj, T_cj, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert, r_star_rho_corr)
     
     def scan_isentrope(carry, v_ratio):
         V_iso = V0 * v_ratio
@@ -126,7 +127,7 @@ def predict_cj_with_isentrope(
             
             n_iso = solve_equilibrium(atom_vec, V_iso, t_mid, A_matrix, coeffs_all, eos_params)
             
-            S_curr = compute_entropy_consistent(n_iso, V_iso, t_mid, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert)
+            S_curr = compute_entropy_consistent(n_iso, V_iso, t_mid, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert, r_star_rho_corr)
             
             # S decreases with T (typically)? Actually S increases with T.
             # If S_curr > S_cj, T is too high.
@@ -139,7 +140,7 @@ def predict_cj_with_isentrope(
         
         # Compute pressure at this isentrope point
         n_iso = solve_equilibrium(atom_vec, V_iso, T_iso, A_matrix, coeffs_all, eos_params)
-        P_pa = compute_pressure_jcz3(n_iso, V_iso, T_iso, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert)
+        P_pa = compute_pressure_jcz3(n_iso, V_iso, T_iso, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_inert, v0_fixed_inert, e_fixed_inert, r_star_rho_corr)
         
         return carry, (V_iso, P_pa / 1e9)
     

@@ -155,10 +155,10 @@ def detonation_forward(
     from pdu.physics.sensitivity import estimate_impact_sensitivity, estimate_sensitivity_class
     from pdu.calibration.differentiable_cj_enhanced import predict_cj_with_isentrope
     from pdu.physics.jwl import fit_jwl_from_isentrope
+    from pdu.physics.kinetics import compute_miller_al_reaction_degree, compute_sj_carbon_energy_delay
     
-    # 1. 数据准备
     # V8.7 Upgrade: Dynamic Species List for Two-Step Calculation
-    # V8.7 Upgrade: Dynamic Species List for Two-Step Calculation
+    # V10.1: Reverting gaseous Al oxides for stability
     base_species = ['N2', 'H2O', 'CO2', 'CO', 'C_graphite', 'H2', 'O2', 'OH', 'NO', 'NH3', 'CH4', 'Al', 'Al2O3']
     
     # Handle Inert Al -> Remove Al products (Solids AND Gases)
@@ -166,9 +166,20 @@ def detonation_forward(
         if verbose: print("V8.7 INFO: Inert Al mode enabled. Removing Al products.")
         base_species = [s for s in base_species if s not in ['Al2O3', 'AlO', 'Al2O']]
     
+    # V10.1: Automatic Rho-Correction for Liquid Explosives (e.g. NM)
+    r_corr_val = 0.0
+    if 'NM' in components:
+        if verbose: print("V10.1 INFO: Liquid Explosive (NM) detected. Applying r* density hardening.")
+        r_corr_val = 0.010 # Stable baseline for 11.8+ GPa
+    
     # V9 Partial Reaction Logic
     # If partial reaction is set for Al, we need to allow Al2O3 but limit available Al
     is_partial_al = False
+    is_auto_miller = False
+    if 'Al' in components and not reaction_degree:
+        is_auto_miller = True
+        if verbose: print("V10.1 INFO: Aluminum detected without manual degree. Enabling Miller Auto-Kinetics.")
+    
     if reaction_degree and 'Al' in reaction_degree:
         is_partial_al = True
         if verbose: print(f"V9 INFO: Partial Al Reaction Mode. Degree = {reaction_degree['Al']}")
@@ -319,17 +330,70 @@ def detonation_forward(
     if verbose and is_partial_al:
         print(f"   -> V0={V0:.2f}, E0={E0:.2f}")
     
-    # 3. 核心计算 (JCZ3 V7)
-    if verbose: print(f"Executing V7 High-Fidelity calculation for {components} at rho={density}...")
+    # 3. 核心计算 (JCZ3 V10.1)
+    if verbose: print(f"Executing V10.1 Full Physics Engine for {components} at rho={density}...")
     
-    D, P_cj, T_cj, V_cj, iso_V, iso_P, _ = predict_cj_with_isentrope(
-        eps_vec, r_vec, alpha_vec, lambda_vec,
-        V0, E0, atom_vec_active, coeffs_all, A_matrix, atomic_masses, 30,
-        solid_mask, solid_v0,
-        n_fixed_inert=n_fixed_inert_val,
-        v0_fixed_inert=v0_fixed_inert_val,
-        e_fixed_inert=e_fixed_inert_val
-    )
+    # Pass 1: Initial estimate with fallback reaction degree
+    init_degree = reaction_degree.get('Al', 0.15) if (reaction_degree and 'Al' in reaction_degree) else 0.15
+    
+    idx_Al_local = ELEMENT_LIST.index('Al')
+    total_al_moles_init = atom_vec[idx_Al_local]
+    mol_inert_init = total_al_moles_init * (1.0 - init_degree)
+    
+    # Pass 1: Preliminary CJ run
+    try:
+        D_raw, P_cj_raw, T_cj_raw, V_cj_raw, iso_V_raw, iso_P_raw, n_cj_raw = predict_cj_with_isentrope(
+            eps_vec, r_vec, alpha_vec, lambda_vec,
+            V0, E0, atom_vec_active, coeffs_all, A_matrix, atomic_masses, 30,
+            solid_mask, solid_v0,
+            n_fixed_inert=mol_inert_init,
+            v0_fixed_inert=v0_fixed_inert_val,
+            e_fixed_inert=e_fixed_inert_val,
+            r_star_rho_corr=r_corr_val
+        )
+    except Exception:
+        # Emergency Fallback if P1 fails
+        if verbose: print("P1 Failed. Retrying without hardening.")
+        D_raw, P_cj_raw, T_cj_raw, V_cj_raw, iso_V_raw, iso_P_raw, n_cj_raw = predict_cj_with_isentrope(
+            eps_vec, r_vec, alpha_vec, lambda_vec,
+            V0, E0, atom_vec_active, coeffs_all, A_matrix, atomic_masses, 30,
+            solid_mask, solid_v0,
+            n_fixed_inert=mol_inert_init,
+            r_star_rho_corr=0.0
+        )
+    
+    D, P_cj, T_cj, V_cj, iso_V, iso_P, n_cj = D_raw, P_cj_raw, T_cj_raw, V_cj_raw, iso_V_raw, iso_P_raw, n_cj_raw
+    
+    # Step 3.1: Apply Miller Kinetics if enabled (Iterative Refinement)
+    if is_auto_miller:
+        miller_degree = compute_miller_al_reaction_degree(float(P_cj), float(T_cj))
+        if verbose: print(f"V10.1 Miller Feedback: Al Reaction Degree = {miller_degree:.3f} (P={float(P_cj):.1f} GPa)")
+        
+        # Pass 2: Re-run with the physically derived degree
+        idx_Al = ELEMENT_LIST.index('Al')
+        total_al_moles = atom_vec[idx_Al]
+        mol_active = total_al_moles * miller_degree
+        mol_inert = total_al_moles * (1.0 - miller_degree)
+        
+        atom_vec_active_miller = atom_vec_active.at[idx_Al].set(mol_active)
+        n_fixed_inert_miller = mol_inert
+        
+        if verbose: print(f"V10.1 Pass 2: Re-calculating CJ with kinetic degree={miller_degree:.3f}...")
+        
+        D, P_cj, T_cj, V_cj, iso_V, iso_P, _ = predict_cj_with_isentrope(
+            eps_vec, r_vec, alpha_vec, lambda_vec,
+            V0, E0, atom_vec_active_miller, coeffs_all, A_matrix, atomic_masses, 30,
+            solid_mask, solid_v0,
+            n_fixed_inert=n_fixed_inert_miller,
+            v0_fixed_inert=v0_fixed_inert_val,
+            e_fixed_inert=e_fixed_inert_val,
+            r_star_rho_corr=r_corr_val
+        )
+        
+    # Step 3.2: SJ Carbon Factor
+    sj_factor = compute_sj_carbon_energy_delay(float(T_cj), float(V_cj))
+    if 'TNT' in components or 'NM' in components:
+        if verbose: print(f"V10.1 SJ-Carbon: Kinetic Delay Factor = {sj_factor:.3f}")
     
     # 4. JWL 拟合 (从等熵线，V8.1 增加 Gamma 锚定)
     V_rel = np.array(iso_V) / V0

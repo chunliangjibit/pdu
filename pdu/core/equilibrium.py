@@ -84,9 +84,10 @@ def _equilibrium_loop_body(state, params_static):
     n_fixed = eos_params[6] if len(eos_params) > 6 else 0.0
     v0_fixed = eos_params[7] if len(eos_params) > 7 else 10.0
     e_fixed = eos_params[8] if len(eos_params) > 8 else 0.0
+    r_corr = eos_params[9] if len(eos_params) > 9 else 0.0
     
     # 1. 计算化学势 (JCZ3 AutoDiff)
-    mu = compute_chemical_potential_jcz3(n, V, T, coeffs, eps, r_star, alpha, lamb, solid_mask, solid_v0, n_fixed, v0_fixed, e_fixed)
+    mu = compute_chemical_potential_jcz3(n, V, T, coeffs, eps, r_star, alpha, lamb, solid_mask, solid_v0, n_fixed, v0_fixed, e_fixed, r_corr)
     
     # 2. 计算残差
     n_64 = to_fp64(n)
@@ -159,10 +160,11 @@ def solve_equilibrium_bwd(res, g_n):
     n_fixed = eos_params[6] if len(eos_params) > 6 else 0.0
     v0_fixed = eos_params[7] if len(eos_params) > 7 else 10.0
     e_fixed = eos_params[8] if len(eos_params) > 8 else 0.0
+    r_corr = eos_params[9] if len(eos_params) > 9 else 0.0
     
     from pdu.physics.eos import compute_total_helmholtz_energy
     H_exact = jax.hessian(compute_total_helmholtz_energy, argnums=0)(
-        n_star, V, T, coeffs, eps, r_s, alpha, lamb, solid_mask, solid_v0, n_fixed, v0_fixed, e_fixed
+        n_star, V, T, coeffs, eps, r_s, alpha, lamb, solid_mask, solid_v0, n_fixed, v0_fixed, e_fixed, r_corr
     )
     
     H_inv = jax.scipy.linalg.inv(H_exact + 1e-6 * jnp.eye(H_exact.shape[0]))
@@ -193,7 +195,8 @@ def solve_equilibrium_bwd(res, g_n):
         nf = params[6] if len(params) > 6 else 0.0
         vf = params[7] if len(params) > 7 else 10.0
         ef = params[8] if len(params) > 8 else 0.0
-        return compute_chemical_potential_jcz3(n_star, V, T, coeffs, e, r, a, lam, sm, sv, nf, vf, ef)
+        rc = params[9] if len(params) > 9 else 0.0
+        return compute_chemical_potential_jcz3(n_star, V, T, coeffs, e, r, a, lam, sm, sv, nf, vf, ef, rc)
     
     _, vjp_fun = jax.vjp(computed_mu_for_diff, *eos_params)
     

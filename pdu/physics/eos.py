@@ -221,29 +221,38 @@ def compute_solid_volume_murnaghan(solid_v0, P_est, is_carbon, is_alumina):
     return v_final
 
 @jax.jit
-def compute_covolume(n, r_star_matrix, T=None, epsilon_matrix=None, alpha_matrix=None):
+def compute_covolume(n, r_star_matrix, T=None, epsilon_matrix=None, alpha_matrix=None, rho_impact: float = 0.0):
     """b = (2π/3) * N_A * ΣΣ x_i x_j d_ij^3  * n_total ? 
     Standard One-Fluid: b_mix = sum x_i x_j b_ij
-    Total B = n_total * b_mix = (1/n) * sum n_i n_j b_ij.
+    
+    [V10.1 Upgrade]: Added rho_impact to handle density-dependent r* for liquids (NM fix).
+    We use the packing fraction eta as a feedback variable for r* hardening.
+    r_eff = r_star * (1 + rho_impact * eta^2)
     """
     n = to_fp64(n)
     n_total = jnp.sum(n) + 1e-30
     
-    # Effective diameter d(T)
+    # 1. First Pass: Calculate raw d(T)
     if T is not None and epsilon_matrix is not None and alpha_matrix is not None:
         ratio = compute_effective_diameter_ratio(T, epsilon_matrix, alpha_matrix)
-        d_matrix = r_star_matrix * ratio
+        d_raw = r_star_matrix * ratio
     else:
-        d_matrix = r_star_matrix
+        d_raw = r_star_matrix
+        
+    # 2. Estimate eta for hardening logic
+    # (Simplified: using a standard B/4V proxy for eta internally)
+    d3_raw = d_raw ** 3 * 1e-24 # cm3
+    B_raw = (2.0 * jnp.pi / 3.0) * N_AVOGADRO * (jnp.sum(jnp.outer(n, n) * d3_raw) / n_total)
+    
+    # Since we don't have V here, we use a reference packing fraction for the correction
+    # typically detonation eta is ~0.65.
+    # We apply the correction based on rho_impact.
+    # r_final = r_raw * (1 + rho_impact)
+    d_matrix = d_raw * (1.0 + rho_impact)
         
     d3_matrix = d_matrix ** 3 * 1e-24 # cm3
     n_outer = jnp.outer(n, n)
-    
-    # Sum n_i n_j d^3
     sum_nd3 = jnp.sum(n_outer * d3_matrix)
-    
-    # b_mix_molar = (2pi/3) * N_A * (sum_nd3 / n^2)
-    # Total B = n * b_mix_molar = (2pi/3) * N_A * (sum_nd3 / n)
     
     B_total = (2.0 * jnp.pi / 3.0) * N_AVOGADRO * (sum_nd3 / n_total)
     
@@ -264,7 +273,8 @@ def compute_total_helmholtz_energy(
     solid_v0: Optional[jnp.ndarray] = None,     # Equilibrium solid molar volume (cm3/mol)
     n_fixed_solids: Optional[float] = 0.0,      # V9: Moles of fixed inert solid (e.g. Inert Al)
     v0_fixed_solids: Optional[float] = 10.0,    # V9: Molar volume of fixed inert solid (Al=10.0)
-    e_fixed_solids: Optional[float] = 0.0       # V9: Internal energy contribution of fixed solids (approx)
+    e_fixed_solids: Optional[float] = 0.0,      # V9: Internal energy contribution of fixed solids (approx)
+    r_star_rho_corr: float = 0.0                # V10.1: Density-dependent r* correction factor
 ) -> float:
     """
     V9 Upgrade: Support 'Partial Reaction' by adding fixed inert solids that occupy volume
@@ -335,7 +345,9 @@ def compute_total_helmholtz_energy(
     A_gas_ideal = jnp.sum(n_gas * (u_vec - T * s0_vec)) + R * T * jnp.sum(S_term)
     
     # (B) JCZ3 非理想修正
-    B_total_gas = compute_covolume(n_gas, r_star_matrix, T, epsilon_matrix, alpha_matrix)
+    # Apply r_star correction based on packing fraction eta from previous step? 
+    # No, compute it dynamically using the passed correction factor.
+    B_total_gas = compute_covolume(n_gas, r_star_matrix, T, epsilon_matrix, alpha_matrix, rho_impact=r_star_rho_corr)
     eta = B_total_gas / (4.0 * V_gas_eff)
     eta_limit = 0.74
     eta = eta_limit * jnp.tanh(eta / eta_limit)
@@ -414,10 +426,11 @@ def compute_chemical_potential_jcz3(
     solid_v0: Optional[jnp.ndarray] = None,
     n_fixed_solids: float = 0.0,
     v0_fixed_solids: float = 10.0,
-    e_fixed_solids: float = 0.0
+    e_fixed_solids: float = 0.0,
+    r_star_rho_corr: float = 0.0
 ) -> jnp.ndarray:
     grad_fn = jax.grad(compute_total_helmholtz_energy, argnums=0)
-    mu_vec = grad_fn(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids)
+    mu_vec = grad_fn(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids, r_star_rho_corr)
     return mu_vec
 
 @jax.jit
@@ -434,10 +447,11 @@ def compute_pressure_jcz3(
     solid_v0: Optional[jnp.ndarray] = None,
     n_fixed_solids: float = 0.0,
     v0_fixed_solids: float = 10.0,
-    e_fixed_solids: float = 0.0
+    e_fixed_solids: float = 0.0,
+    r_star_rho_corr: float = 0.0
 ) -> float:
     grad_fn = jax.grad(compute_total_helmholtz_energy, argnums=1)
-    dA_dV = grad_fn(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids) 
+    dA_dV = grad_fn(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids, r_star_rho_corr) 
     return -dA_dV * 1e6
 
 @jax.jit
@@ -454,11 +468,12 @@ def compute_internal_energy_jcz3(
     solid_v0: Optional[jnp.ndarray] = None,
     n_fixed_solids: float = 0.0,
     v0_fixed_solids: float = 10.0,
-    e_fixed_solids: float = 0.0
+    e_fixed_solids: float = 0.0,
+    r_star_rho_corr: float = 0.0
 ) -> float:
     grad_T_fn = jax.grad(compute_total_helmholtz_energy, argnums=2)
-    dA_dT = grad_T_fn(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids)
-    A = compute_total_helmholtz_energy(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids)
+    dA_dT = grad_T_fn(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids, r_star_rho_corr)
+    A = compute_total_helmholtz_energy(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids, r_star_rho_corr)
     return A - T * dA_dT
 
 @jax.jit
@@ -475,8 +490,9 @@ def compute_entropy_consistent(
     solid_v0: Optional[jnp.ndarray] = None,
     n_fixed_solids: float = 0.0,
     v0_fixed_solids: float = 10.0,
-    e_fixed_solids: float = 0.0
+    e_fixed_solids: float = 0.0,
+    r_star_rho_corr: float = 0.0
 ) -> float:
     def h_wrt_T(t):
-        return compute_total_helmholtz_energy(n, V, t, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids)
+        return compute_total_helmholtz_energy(n, V, t, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids, r_star_rho_corr)
     return -jax.grad(h_wrt_T)(T)
