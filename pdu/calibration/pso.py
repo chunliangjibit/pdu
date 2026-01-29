@@ -34,11 +34,13 @@ class PSOOptimizer:
         
         # 1. Initialize Particles
         pos = jax.random.uniform(k1, (self.num_particles, self.dim), minval=self.lb, maxval=self.ub)
-        vel = jax.random.uniform(k2, (self.num_particles, self.dim), minval=-0.1, maxval=0.1)
+        # Scale velocity by search range
+        range_vec = self.ub - self.lb
+        vel = jax.random.uniform(k2, (self.num_particles, self.dim), minval=-0.2*range_vec, maxval=0.2*range_vec)
         
         # 2. Initial Evaluation
         fitness = jax.vmap(self.objective_fn)(pos)
-        fitness = jnp.nan_to_num(fitness, nan=1e10, posinf=1e10, neginf=1e10)
+        fitness = jnp.nan_to_num(fitness, nan=1e12, posinf=1e12, neginf=1e12)
         
         pbest_pos = pos
         pbest_fit = fitness
@@ -47,6 +49,11 @@ class PSOOptimizer:
         gbest_pos = pos[gbest_idx]
         gbest_fit = fitness[gbest_idx]
         
+        # Hyperparameters (Optimized for convergence)
+        w_pso = 0.8
+        c1_pso = 2.0
+        c2_pso = 2.0
+
         def iter_body(i, state):
             (pos, vel, pbest_pos, pbest_fit, gbest_pos, gbest_fit, key) = state
             
@@ -55,9 +62,9 @@ class PSOOptimizer:
             r2 = jax.random.uniform(k2, (self.num_particles, self.dim))
             
             # Update Velocity
-            new_vel = self.w * vel + \
-                      self.c1 * r1 * (pbest_pos - pos) + \
-                      self.c2 * r2 * (gbest_pos - pos)
+            new_vel = w_pso * vel + \
+                      c1_pso * r1 * (pbest_pos - pos) + \
+                      c2_pso * r2 * (gbest_pos - pos)
             
             # Update Position
             new_pos = pos + new_vel

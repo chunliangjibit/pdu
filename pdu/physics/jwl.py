@@ -108,16 +108,14 @@ def fit_jwl_from_isentrope(
     def objective(params):
         A, B, R1, R2, w, C = params
         
-        # ========== V10.5 增强物理约束 (专家意见响应) ==========
-        # 基础参数范围约束 (放宽 B 的限制，允许为负)
-        # R1 > R2 是数学单调性的基本要求
-        bad = (A < 0) | (C < 0) | (w < 0) | (w > 1.2) | (R1 < (R2 + 0.1)) | (R2 < 0.1)
+        # ========== V10.6 增强物理约束 (专家意见响应) ==========
+        # Target range: [0.25, 0.45] for CHNO
+        bad = (A < 50.0) | (C < 0.0) | (w < 0.25) | (w > 0.45) | (R1 < (R2 + 1.0)) | (R2 < 0.3)
         penalty_barrier = jnp.where(bad, 1e9, 0.0)
         
-        # [V10.5 新增] R1 软约束：工程推荐 [4.5, 6.0]
-        # 若 R1 偏离此区间，施加渐进惩罚，除非拟合误差降低能抵消惩罚
-        penalty_r1 = jnp.where(R1 > 6.0, (R1 - 6.0)**2 * 100.0, 0.0) + \
-                     jnp.where(R1 < 4.0, (4.0 - R1)**2 * 100.0, 0.0)
+        # [V10.6] Topology Constraint (A vs B)
+        ratio_BA = B / (A + 1e-3)
+        penalty_topology = jnp.where(ratio_BA > 0.1, (ratio_BA - 0.1)**2 * 10000.0, 0.0)
 
         # [V10.5 关键改进] 声速稳定性检查 (Stability Watchdog)
         # c² = -V² * dP/dV
@@ -161,72 +159,26 @@ def fit_jwl_from_isentrope(
         # (A) Log-MSE Loss
         weights = jnp.where(V_rel_array < 1.2, 2.0,
                            jnp.where(V_rel_array < 3.0, 1.5, 1.0))
-        loss_fit = jnp.mean(weights * (y_pred_log - y_log)**2) * 50.0
+        loss_fit = jnp.mean(weights * (y_pred_log - y_log)**2) * 5000.0 # High weight for V10.6
         
-        # (B) P_CJ Anchor Penalty (Relaxed)
+        # (B) P_CJ Anchor Penalty (V10.6 Harder)
         P_fit_cj = A * jnp.exp(-R1 * V_cj_rel) + \
                    B * jnp.exp(-R2 * V_cj_rel) + \
                    C / (jnp.maximum(V_cj_rel, 1e-4)**(1.0 + w))
         
-        if target_P_cj is not None:
-             # 允许 5% 的松弛误差 (V10.5 Relaxed Strategy)
-             rel_err = jnp.abs(P_fit_cj - target_P_cj) / target_P_cj
-             loss_anchor_P = jnp.where(rel_err > 0.05, (rel_err - 0.05)**2 * 10000.0, 0.0)
-        else:
-             loss_anchor_P = ((P_fit_cj - P_cj) / P_cj) ** 2 * 100.0
-        
-        return (loss_fit + loss_anchor_P + penalty_barrier + penalty_r1 +
-                stability_penalty + curvature_penalty)
-        
-        # (C) Gamma_CJ Anchor Penalty
-        if target_P_cj is None:
-            dP_dV = -A * R1 * jnp.exp(-R1 * V_cj_rel) - \
-                    B * R2 * jnp.exp(-R2 * V_cj_rel) - \
-                    C * (1.0 + w) * (V_cj_rel**-(2.0 + w))
-            gamma_pred = -(V_cj_rel / (P_fit_cj + 1e-6)) * dP_dV
-            loss_anchor_Gamma = ((gamma_pred - gamma_cj_target) / gamma_cj_target) ** 2 * 50.0 
-        else:
-            loss_anchor_Gamma = 0.0
+        rel_err = jnp.abs(P_fit_cj - P_cj) / P_cj
+        loss_anchor_P = jnp.where(rel_err > 0.01, (rel_err - 0.01)**2 * 200000.0, 0.0)
+
+        # (D) Total Energy Constraint
+        V_start = target_V_cj if target_V_cj is not None else V_cj_rel
+        term1_e = (A / R1) * jnp.exp(-R1 * V_start)
+        term2_e = (B / R2) * jnp.exp(-R2 * V_start)
+        term3_e = (C / jnp.maximum(w, 1e-3)) * (V_start**(-w))
+        E_integral = term1_e + term2_e + term3_e
+        loss_energy = ((E_integral - target_E) / target_E) ** 2 * 10000.0
             
-        # (D) Total Energy Constraint [V8.7 Upgrade]
-        loss_energy = 0.0
-        if constraint_total_energy is not None:
-            V_start = target_V_cj if target_V_cj is not None else V_cj_rel
-            
-            term1 = (A / R1) * jnp.exp(-R1 * V_start)
-            term2 = (B / R2) * jnp.exp(-R2 * V_start)
-            term3 = (C / jnp.maximum(w, 1e-3)) * (V_start**(-w))
-            
-            E_integral = term1 + term2 + term3
-            loss_energy = ((E_integral - constraint_total_energy) / constraint_total_energy) ** 2 * 5000.0
-        
-        # (H) V10.2 膨胀功分段验证
-        # 计算高压区 (V: 0.6-1.5) 和中压区 (V: 1.5-5.0) 的膨胀功
-        V_high = jnp.array([0.6, 0.8, 1.0, 1.2, 1.5])
-        V_mid = jnp.array([1.5, 2.0, 3.0, 4.0, 5.0])
-        
-        P_high = A * jnp.exp(-R1 * V_high) + B * jnp.exp(-R2 * V_high) + C / (V_high**(1.0 + w))
-        P_mid = A * jnp.exp(-R1 * V_mid) + B * jnp.exp(-R2 * V_mid) + C / (V_mid**(1.0 + w))
-        
-        # 膨胀功应随体积增加而增加 (积分值递增)
-        work_high = jnp.trapezoid(P_high, V_high)
-        work_mid = jnp.trapezoid(P_mid, V_mid)
-        
-        # 高压区贡献应大于中压区
-        work_penalty = jnp.where(work_high < work_mid * 0.5, 1e6, 0.0)
-            
-        # (E) Prior Penalty
-        loss_prior = 0.0
-        if exp_priors:
-            ep = exp_priors
-            loss_prior += ((A - ep['A'])/ep['A'])**2 * 5.0
-            loss_prior += ((B - ep['B'])/ep['B'])**2 * 2.0
-            loss_prior += ((R1 - ep['R1'])/ep['R1'])**2 * 10.0
-            loss_prior += ((R2 - ep['R2'])/ep['R2'])**2 * 10.0
-            loss_prior += ((w - ep['omega'])/ep['omega'])**2 * 10.0
-            
-        return (loss_fit + loss_anchor_P + loss_anchor_Gamma + loss_energy + loss_prior + 
-                penalty_barrier + sound_speed_penalty + curvature_penalty + work_penalty)
+        return (loss_fit + loss_anchor_P + loss_energy + 
+                penalty_barrier + stability_penalty + curvature_penalty + penalty_topology)
 
     # 5. 优化准备 (使用先验作为初始值)
     if exp_priors:
@@ -299,37 +251,36 @@ def fit_jwl_from_isentrope(
 
         return JWLParams(A=float(A), B=float(B), R1=float(R1), R2=float(R2), omega=float(w), E0=float(E0), fit_mse=float(final_mse))
 
-    # V10.5 P0-5: Relaxed Penalty Method (6-Param Full Search)
+    # V10.6: Seeded PSO search
     if method == 'RELAXED_PENALTY':
         from pdu.calibration.pso import PSOOptimizer
-        print(f"[V10.5 Relaxed] Running 6-Param Penalty Optimization...")
+        print(f"[V10.6 Constrained] Running Seeded 6-Param Search...")
         
         target_E = constraint_total_energy if constraint_total_energy is not None else (E0 * 1000.0)
+        slope_target = -(rho0 * (D_cj**2) * 1e-9)
         
+        # Define objective with high MSE weight
         def penalty_obj(p):
-            # p: [A, B, R1, R2, w, C]
-            return loss_penalty_jwl(p, V_rel_array, P_array, V_cj_rel, P_cj, target_E)
-            
-        # Bounds: A, B, R1, R2, w, C
-        # A: [100, 3000]
-        # B: [-20, 100]
-        # R1: [3.5, 8.0]
-        # R2: [0.5, 3.0]
-        # w: [0.1, 0.6]
-        # C: [0.0, 50.0] - C 必须为正，且通常在 0-10 之间
-        lb = jnp.array([100.0, -20.0, 3.5, 0.5, 0.10, 0.0])
-        ub = jnp.array([3000.0, 100.0, 8.0, 3.0, 0.60, 50.0])
+             # p: [A, B, R1, R2, w, C]
+             return loss_penalty_jwl(p, V_rel_array, P_array, V_cj_rel, P_cj, target_E, Slope_target=slope_target)
+
+        # Search space for R1, R2, w
+        # We will use these to generate A, B, C seeds
+        lb_r = jnp.array([3.5, 0.5, 0.25])
+        ub_r = jnp.array([10.0, 3.5, 0.45])
         
-        pso = PSOOptimizer(penalty_obj, lb, ub, num_particles=80)
-        best_x, best_f = pso.optimize(num_iterations=150)
+        # Bounds for full 6 params
+        lb = jnp.array([50.0, 0.1, 3.5, 0.5, 0.25, 0.1])
+        ub = jnp.array([4000.0, 100.0, 10.0, 3.5, 0.45, 20.0])
         
-        A, B, R1, R2, w, C = best_x
+        pso = PSOOptimizer(penalty_obj, lb, ub, num_particles=100)
+        best_x, best_f = pso.optimize(num_iterations=400)
         
-        # Check Final Quality
-        print(f"[V10.5 Relaxed] Result: A={A:.1f}, B={B:.2f}, R1={R1:.2f}, R2={R2:.2f}, w={w:.3f}, C={C:.2f}")
-        if B < 0.1:
-            print("WARNING: B is dangerously low or negative despite penalty!")
-            
+        # [V10.6] Nelder-Mead Refinement for sub-Gpa precision
+        x0 = np.array(best_x)
+        res = minimize(objective, x0, method='Nelder-Mead', tol=1e-6, options={'maxiter': 2000})
+        A, B, R1, R2, w, C = res.x
+        
         # Calculate final MSE
         P_final = A * np.exp(-R1 * V_rel_array) + \
                  B * np.exp(-R2 * V_rel_array) + \
@@ -337,6 +288,8 @@ def fit_jwl_from_isentrope(
         final_mse = np.mean((np.log(np.maximum(P_final, 1e-6)) - y_log)**2)
         
         return JWLParams(A=float(A), B=float(B), R1=float(R1), R2=float(R2), omega=float(w), E0=float(E0), fit_mse=float(final_mse))
+
+
 
     if method == 'PSO':
         from pdu.calibration.pso import PSOOptimizer
@@ -420,49 +373,69 @@ def loss_penalty_jwl(
     params, 
     V_data, P_data, 
     V_cj, P_cj, 
-    E_target
+    E_target,
+    Slope_target = None  # V10.6: Optional slope constraint
 ):
     """
-    V10.5 Penalty Loss Function (6-Param Mode)
-    Objective = LogMSE + Lambda_CJ*(P-P_cj)^2 + Lambda_E*(E-E0)^2 + Barriers
+    V10.6 Constrained Physics Loss (Response to Audit)
+    Objective = LogMSE + Lambda_CJ*(P-P_cj)^2 + Lambda_Slope*(Slope-Slope_cj)^2 + Barriers
     """
     A, B, R1, R2, w, C = params
     
     # 1. Energy Constraint (Soft Penalty)
-    # E_calc(V_CJ) = term1 + term2 + C/w * V_cj^-w
-    
     term1 = (A / R1) * jnp.exp(-R1 * V_cj)
     term2 = (B / R2) * jnp.exp(-R2 * V_cj)
     term3 = (C / w) * (V_cj**-w)
-    
     E_calc = term1 + term2 + term3
-    
-    # Energy Loss: Relative error squared
-    # Weight: 1000.0 (Strong but not barrier)
-    loss_energy = ((E_calc - E_target) / E_target)**2 * 1000.0
+    loss_energy = ((E_calc - E_target) / E_target)**2 * 10000.0 # Increased weight
     
     # 2. Fit Error
     P_pred = A * jnp.exp(-R1 * V_data) + B * jnp.exp(-R2 * V_data) + C / (V_data**(1.0+w))
-    
-    # [V10.5 Fix] Penalize Negative Pressure HARD to avoid Log-truncation plateau
     penalty_neg_P = jnp.sum(jnp.where(P_pred < 1e-4, 1e9, 0.0))
-    
     log_err = jnp.log(jnp.maximum(P_pred, 1e-6)) - jnp.log(jnp.maximum(P_data, 1e-4))
-    mse = jnp.mean(log_err**2) * 50.0
+    mse = jnp.mean(log_err**2) * 5000.0
     
-    # 3. CJ Anchor Penalty (Relaxed)
+    # 3. CJ Anchor Penalty (V10.6 Harder Anchor)
     P_at_cj = A * jnp.exp(-R1 * V_cj) + B * jnp.exp(-R2 * V_cj) + C / (V_cj**(1.0+w))
-    # Allow 5% error without heavy penalty, then scale up
-    rel_err_cj = (P_at_cj - P_cj) / P_cj
-    # penalty = 0 if |err| < 0.05 else large
-    # Smooth penalty: 100 * err^2
-    penalty_cj = 1000.0 * rel_err_cj**2
+    rel_err_cj = jnp.abs(P_at_cj - P_cj) / P_cj
+    # V10.6: Abandon 5% relaxed zone, use 1% tolerance or direct penalty
+    penalty_cj = jnp.where(rel_err_cj > 0.01, (rel_err_cj - 0.01)**2 * 200000.0, 0.0)
     
-    # 4. Physical Barriers (B > 0 is critical)
-    barrier_A = jnp.where(A < 1.0, 1e8, 0.0) # A must be significant
-    barrier_R = jnp.where(R1 < R2 + 0.5, 1e8, 0.0)
+    # 3.1 Slope Anchor (Rayleigh Line consistency)
+    loss_slope = 0.0
+    if Slope_target is not None:
+        dP_dV_fit = -A*R1*jnp.exp(-R1*V_cj) - B*R2*jnp.exp(-R2*V_cj) - C*(1.0+w)*(V_cj**-(2.0+w))
+        # Relative slope error
+        loss_slope = ((dP_dV_fit - Slope_target) / Slope_target)**2 * 500.0
+
+    # 3.2 Sound Speed Stability watchdog (Ensure c2 > 0)
+    def check_c2(v):
+        dp_dv = -A*R1*jnp.exp(-R1*v) - B*R2*jnp.exp(-R2*v) - C*(1.0+w)*(v**-(2.0+w))
+        return -v**2 * dp_dv
     
-    return mse + penalty_cj + loss_energy + penalty_neg_P + barrier_A + barrier_R
+    v_test = jnp.array([1.0, 1.5, 2.5, 5.0, 10.0])
+    c2_vals = jax.vmap(check_c2)(v_test)
+    penalty_c2 = jnp.sum(jnp.where(c2_vals < 1e-4, 1e10, 0.0))
+
+    # 4. [V10.6] Grüneisen Constraint (Physics Barrier)
+    # Target range: [0.25, 0.45]
+    w_min, w_max = 0.25, 0.45
+    penalty_omega = jnp.where(w < w_min, (w_min - w)**2 * 100000.0, 0.0) + \
+                    jnp.where(w > w_max, (w - w_max)**2 * 100000.0, 0.0)
+    
+    # [V10.6] Omega Centering: Favor values near 0.30 for physical topology
+    penalty_w_center = (w - 0.30)**2 * 1000.0
+
+    # 5. [V10.6] Topology Constraint (A vs B)
+    # Prevent B from dominating high pressure. Usually A > 10*B
+    ratio_BA = B / (A + 1e-3)
+    penalty_topology = jnp.where(ratio_BA > 0.1, (ratio_BA - 0.1)**2 * 10000.0, 0.0)
+
+    # 6. Physical Barriers (Monotonicity)
+    barrier_A = jnp.where(A < 10.0, 1e8, 0.0)
+    barrier_R = jnp.where(R1 < R2 + 0.8, 1e8, 0.0)
+    
+    return mse + penalty_cj + loss_energy + penalty_neg_P + barrier_A + barrier_R + penalty_omega + penalty_topology + loss_slope + penalty_c2 + penalty_w_center
 
 
 

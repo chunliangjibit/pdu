@@ -101,7 +101,7 @@ def run_v10_5_full_skill():
             # V10.5: 使用 RELAXED_PENALTY 拟合算法
             res = detonation_forward(
                 comps, fracs, rho, 
-                verbose=False, # Reduce console noise
+                verbose=is_aluminized, # Show details for Al
                 reaction_degree=None, 
                 combustion_efficiency=1.0,
                 fitting_method='RELAXED_PENALTY'  # [P0-5]

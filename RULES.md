@@ -3,292 +3,41 @@
 ## 0. 项目目标与核心功能
 
 ### 0.1 正向计算：全面爆轰性能预测
-
-**输入**：配方（组分 + 比例）
-
-**输出**：
-| 类别 | 参数 |
-|------|------|
-| 基础性能 | 爆速 $D$、爆压 $P_{CJ}$、爆温 $T_{CJ}$、CJ点密度 $\rho_{CJ}$ |
-| 能量参数 | 爆热 $Q$、比冲 $I_{sp}$（可选） |
-| 产物信息 | 爆轰产物组成、摩尔分数（含气固分离） |
-| 氧平衡 | $OB\%$ — 氧平衡百分比 |
-| 感度估计 | $h_{50}$ — Kamlet公式撞击感度估计值 (仅供参考) |
-| **JWL状态方程参数** | $A$, $B$, $R_1$, $R_2$, $\omega$, $E_0$ — **对数域拟合 + CJ锚定，核心输出** |
+**输出参数**：D, P_CJ, T_CJ, Q, JWL-5参数 (A, B, R1, R2, w).
 
 ### 0.2 逆向设计：多目标约束反推配方
-
-**输入**：目标性能参数组合（可选一种或多种）
-- 示例约束：目标爆速 8500 m/s + 目标密度 1.8 g/cm³ + 目标爆压 30 GPa
-
-**输出**：满足约束的配方（组分 + 比例）
-
-### 0.3 技术路线
-
-使用 **JAX 可微分编程** 实现端到端梯度传播，支持：
-- 配方参数 → 性能参数的梯度计算
-- 基于梯度的配方优化（逆向设计）
-
----
-
-## 1. 开发环境规范
-
-### 1.1 虚拟环境
-- **必须**在 conda 虚拟环境 `nnrf` 下进行所有开发工作
-- 激活环境命令：`mamba activate nnrf`
-
-### 1.2 依赖安装
-- **首选**：`mamba install -c conda-forge <package_name>`
-- **备选**：若 conda-forge 无对应包，使用 `pip install <package_name>`
-- **注意**：安装前需确认环境已激活，避免污染系统环境
-
-### 1.3 核心依赖列表
-```bash
-# JAX GPU 版本 (CUDA 12)
-mamba install -c conda-forge jax jaxlib cuda-nvcc
-
-# 科学计算
-mamba install -c conda-forge numpy scipy
-
-# 优化器
-mamba install -c conda-forge optax
-
-# 数据处理与可视化
-mamba install -c conda-forge pandas matplotlib
-```
 
 ---
 
 ## 2. 代码架构原则
 
-### 2.1 精度控制策略 (Precision Strategy)
-- **全局启用 Float64**: 为保证热力学计算（尤其是熵和吉布斯能）的绝对精度，系统默认开启双精度。
-- **配置**: `jax.config.update("jax_enable_x64", True)`
-- **例外**: 仅在极大规模神经网络推理（非物理内核）时允许使用 FP32。
-
-### 2.2 隐式微分 (Implicit Differentiation)
-- **禁止**：记录牛顿法迭代的完整计算图（会导致 OOM）
-- **必须**：使用 `@custom_vjp` 实现隐式微分，只在收敛点计算梯度
-- **原则**：前向求解不存梯度，反向传播解伴随方程
-
-### 2.3 对数域变量 (Log-Space)
-- **必须**：使用 $z_i = \ln(n_i)$ 替代直接求解摩尔数 $n_i$
-- **理由**：避免小量下溢，保证 $n_i > 0$
-
-### 2.4 动态掩码 (Dynamic Masking)
-- 根据元素守恒预生成 `active_mask`
-- 对不可能生成的产物直接 Mask，减少无效计算
-
-### 2.5 混合先验自动融合 (Automatic Prior Blending)
-- **要求**：对于未知混合炸药（如 HMX/TNT 混合物），系统**必须**自动根据质量分数插值单体成分的文献 JWL 参数作为拟合先验。
-- **目标**：解决 JWL 参数拟合的非唯一性数学问题，确保物理曲线的趋势符合大宗炸药的基本物理规律。
-
----
-
-## 3. RTX 4060 硬件优化原则
-
-### 3.1 显存管理
-```python
-import os
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".85"  # 保留 15% 显存
-```
-
-### 3.2 Batch Size 限制
-- **推荐**：512（黄金值）
-- **上限**：1024（超过会导致 L2 Cache 命中率下降 + OOM 风险）
-
-### 3.3 JIT 编译
-- **必须**：所有计算函数使用 `@jax.jit` 装饰器
-- **禁止**：在热路径中使用 Python 原生循环
-- **推荐**：使用 `jax.lax.while_loop` 替代 Python 循环
-
-### 3.4 调试配置
-```python
-# 开发阶段开启 NaN 检测
-jax.config.update("jax_debug_nans", True)
-```
+### 2.1 精度控制策略
+- **全局启用 Float64**: `jax.config.update("jax_enable_x64", True)`。
 
 ---
 
 ## 4. 物理正确性原则
 
-### 4.1 守恒律验证
-- 每次迭代后检查质量守恒、元素守恒
-- 能量守恒残差目标：< $10^{-6}$
-
-### 4.2 梯度验证
-- 使用数值差分 (`finite_difference`) 与 `jax.grad` 对比
-- 误差阈值：< $10^{-5}$
-
-### 4.3 相变处理
-- **前向**：严谨的 `if-else` 离散逻辑
-- **反向**：固定相态假设（Straight-Through Estimator）
-
-### 4.4 热力学修正 (Thermodynamic Rigor) - V8.5+
-- **生成内能计算**: 必须使用 $\Delta_f U^\circ = \Delta_f H^\circ - \Delta n_{gas}RT$ 修正公式。
-- **严禁**: 直接使用焓变 $\Delta H$ 近似内能 $\Delta U$（会导致爆热误差 > 50%）。
+### 4.5 V10.6 物理与拟合强制规范 (V10.6 Mandates)
+- **Matrix Quenching**: 对于含金属（Al, B, etc.）混合炸药，必须在 `api.py` 中应用矩阵淬灭因子（建议 0.94-0.98），模拟反应效率下降。
+- **Physical Heat Sink**: 惰性组分必须被建模为热沉，在 CJ 平衡计算中扣除其升温显热。
+- **JWL Physics Barriers**: 
+    - **Grüneisen Range**: 强制 $\omega \in [0.25, 0.45]$。
+    - **Topology Ratio**: 强制 $B/A < 0.1$。
+    - **Energy Cutoff**: 含铝炸药 JWL $E_0$ 目标值需乘上有效做功系数（建议 0.72），将后燃烧能量剥离。
+    - **Slope Anchor**: 拟合必须考虑 CJ 点的 Rayleigh 线斜率约束。
 
 ---
 
 ## 5. 测试与验证规范
 
-### 5.1 单元测试
-- 每个核心模块必须有对应的测试用例
-- 使用 `pytest` 框架
+### 5.2 物理验证协议
+必须运行全量对标脚本，并将结果更新至 `docs/project_whitepaper.md`。
 
-### 5.2 物理验证协议 (Mandatory!)
-每次重大更新必须运行 `v8_comprehensive_test.py` 进行全量参数对标：
-1. **测试炸药集**：
-   - 单体：HMX, RDX, PETN, TNT, NM
-   - 混合：Comp B (RDX/TNT), Octol (HMX/TNT)
-   - 含铝：Tritonal (TNT/Al), PBXN-109 (RDX/Al/Binder)
-2. **对标参数集**：
-   - 基础：$D$ (爆速)、$P_{CJ}$ (爆压)、$T_{CJ}$ (爆温)、$Q$ (爆热)
-   - **JWL 完整系数**：$A, B, R_1, R_2, \omega$ 必须全部列出并对标。**严禁只列出 A 和 $\omega$。**
-   - 物理曲线：$P-V$ 曲线的 MAE (Mean Absolute Error)
-3. **数据来源**：必须明确标注实验值来源（如 LLNL, EXPLO5, 经典文献）
-4. **诚实原则 (Honest Disclosure)**：禁止对误差进行任何形式的包装或掩盖。
-   - 所有的物理参数（D, P, T, Q, JWL-5参数）误差必须如实反映在 `v8_performance_report.md` 中。
-   - 若物理模型在此点位失效（如爆温偏差 > 15%），必须明确标记为“待优化物理点”，作为下一阶段校准的目标。
-   - 杜绝“只报爆速，不报爆压/爆温”或“JWL 参数缺失”的行为。
-
-### 5.3 误差阈值标准 (Target)
-| 参数 | 核心单体 (HMX/RDX) | 混合/含铝炸药 | 备注 |
-| :--- | :---: | :---: | :--- |
-| 爆速 $D$ | < 3% | < 5% | - |
-| 爆压 $P_{CJ}$ | TBD | TBD | **V8.5 已知瓶颈**: 物理一致参数导致系统性低估约 15-20%。 |
-| 爆热 $Q$ | < 10% | < 15% | V8.5 修复后已达标 |
-| JWL 曲线 | MAE < 0.5 GPa | MAE < 1.0 GPa | - |
-
-### 5.4 性能基准
-- 单状态点计算时间目标：< 10ms
-- 显存占用目标（含梯度）：< 2GB
+### 5.4 诚实原则 (Honest Disclosure)
+- 严禁隐瞒 JWL 参数的非物理行为（如 B < 0）。
+- 必须如实报告含铝炸药的爆压/爆速偏差，作为模型演进的动力。
 
 ---
-
-## 6. 代码风格
-
-### 6.1 命名规范
-- 函数名：`snake_case`（如 `compute_gibbs_energy`）
-- 类名：`PascalCase`（如 `EquilibriumSolver`）
-- 常量：`UPPER_SNAKE_CASE`（如 `GAS_CONSTANT`）
-
-### 6.2 文档要求
-- 所有公共函数必须有 docstring
-- 物理公式必须在注释中标明出处
-
-### 6.3 类型标注
-- 使用 Python type hints
-- JAX 数组类型：`jax.Array` 或 `jnp.ndarray`
-
----
-
-## 7. Git 工作流
-
-### 7.1 分支策略
-- `main`：稳定版本
-- `dev`：开发分支
-- `feature/<name>`：功能分支
-
-### 7.2 提交规范
-- 格式：`<type>: <description>`
-- 类型：`feat`, `fix`, `docs`, `refactor`, `test`, `perf`
-
----
-
-## 9. 技术咨询报告规范
-
-### 9.1 触发条件
-
-当遇到以下情况时，**必须**编写技术咨询报告：
-- 物理模型出现系统性偏差 (> 15%)
-- 核心算法遇到理论性障碍
-- 需要外部专家或文献指导
-
-### 9.2 报告结构
-
-技术咨询报告**必须**包含以下章节：
-
-1. **项目概述**
-   - 核心目标与技术路线
-   - 当前版本号与物理内核说明
-
-2. **当前成就**
-   - 已完成的物理升级列表
-   - 验证结果汇总表（包含误差范围）
-
-3. **技术瓶颈与咨询需求**
-   - **问题描述**：现象 + 数据表格
-   - **根本原因分析**：物理机制或数学推导
-   - **咨询问题**：清晰的技术疑问 + 候选方案
-   - **优先级标注**：P0 (Critical) / P1 (High) / P2 (Medium)
-
-4. **代码库状态**
-   - 核心模块清单与状态
-   - Git 仓库地址与最新提交
-
-5. **优先级排序表**
-
-6. **附录**
-   - 完整验证结果路径
-   - 相关参数表
-
-### 9.3 文件保存位置
-
-**必须**保存到 `docs/` 目录，命名格式：
-```
-docs/v<version>_<phase>_technical_consultation.md
-```
-示例：`docs/v8_4_technical_consultation.md`
-
-### 9.4 配套操作
-
-编写咨询报告后，**必须**执行以下流程：
-1. 运行 `python temp/bundle_project.py` 生成代码快照
-2. 提交并推送到 Git 仓库
-3. 在 `RULES.md` 的更新日志中记录咨询报告版本
-
-### 9.5 诚实原则
-
-- **禁止**隐瞒或粉饰物理误差
-- **必须**提供完整的验证数据表格
-- **必须**明确标注"不确定"或"需要文献支持"的技术点
-
----
-
-## 10. 项目结构规划
-
-```
-PyDetonation-Ultra/
-├── pdu/                    # 核心包
-│   ├── __init__.py
-│   ├── core/               # 核心求解器
-│   │   ├── equilibrium.py  # 平衡求解器 + 隐式微分
-│   │   ├── newton.py       # 混合精度牛顿法
-│   │   └── cj_search.py    # CJ 点搜索 (Brent 方法)
-│   ├── physics/            # 物理模块
-│   │   ├── eos.py          # JCZ3 状态方程 (产物EOS)
-│   │   ├── jwl.py          # JWL 状态方程拟合 (核心输出!)
-│   │   ├── thermo.py       # 热力学函数 (NASA 多项式)
-│   │   └── potential.py    # 分子势能函数 (Exp-6)
-│   ├── ai/                 # AI 加速模块
-│   │   ├── warmstart.py    # Tiny-MLP 初值预测
-│   │   └── projection.py   # 原子守恒投影层
-│   ├── inverse/            # 逆向设计模块
-│   │   ├── optimizer.py    # 多目标优化器 (optax)
-│   │   ├── loss.py         # 多目标 Loss 函数
-│   │   └── constraints.py  # 配方约束 (元素比例、密度等)
-│   └── utils/              # 工具函数
-│       ├── precision.py    # 精度控制
-│       ├── masking.py      # 动态掩码
-│       └── outputs.py      # 输出格式化 (所有性能参数)
-├── data/                   # 热力学数据库
-│   ├── nasa_polynomials.json
-│   └── jcz3_params.json    # JCZ3 势能参数
-├── tests/                  # 测试
-├── examples/               # 示例脚本
-│   ├── forward_demo.py     # 正向计算示例
-│   └── inverse_demo.py     # 逆向设计示例
-├── docs/                   # 文档
-└── RULES.md                # 本文件
-```
+**版本**: V10.6 "Constrained Physics"
+**更新日期**: 2026-01-29

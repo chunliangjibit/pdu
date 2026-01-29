@@ -767,7 +767,8 @@ def compute_oxide_thermal_lag(
     D0: float,
     T_gas: float,
     P_gas: float,
-    T_melt_oxide: float = 2327.0
+    T_melt_oxide: float = 2327.0,
+    n_diameter: float = 1.6  # V10.5 Adaptive Exponent (Expert Feedback)
 ) -> float:
     """
     计算氧化层受热熔化/破裂的诱导时间 (Induction Time)
@@ -783,6 +784,7 @@ def compute_oxide_thermal_lag(
     Args:
         D0: 颗粒直径 (m)
         T_gas: 气体温度 (K)
+        n_diameter: 粒径指数 (Default 1.6 for mAl, 1.0 for nAl)
         
     Returns:
         tau_ind: 热滞后时间 (s)
@@ -802,7 +804,7 @@ def compute_oxide_thermal_lag(
     # 压力越高，传热越快 (Nu ~ Re^0.5 ~ rho^0.5 ~ P^0.5)
     press_factor = (20.0 / jnp.maximum(P_gas, 1.0)) ** 0.3
     
-    tau_ind = tau_ref * (D0 / d_ref)**1.8 * temp_factor * press_factor
+    tau_ind = tau_ref * (D0 / d_ref)**n_diameter * temp_factor * press_factor
     
     return jnp.clip(tau_ind, 1e-9, 1e-4)
 

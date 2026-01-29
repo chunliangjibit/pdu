@@ -4,60 +4,55 @@
 
 **PyDetonation-Ultra (PDU)** is a high-fidelity, differentiable physics engine designed for simulating detonation performance and calibrating Equation of State (EOS) parameters for explosives. Built on **JAX**, it leverages automatic differentiation to enable gradient-based optimization for inverse design (recipe formulation) and parameter fitting.
 
-The project is currently in the **V10.5 "Thermal Lag & Relaxed Anchor"** phase, focusing on resolving long-standing discrepancies in modeling non-ideal aluminized explosives (like Tritonal and PBXN-109) and stabilizing JWL parameter fitting.
+The project is currently in the **V10.6 "Constrained Physics"** phase, focusing on physical consistency and engineering compatibility of JWL parameters.
 
 ### Core Technologies
 *   **Language:** Python 3.9+
-*   **Framework:** JAX (with `jax_enable_x64` strictly enabled for thermodynamic precision)
-*   **Optimization:** Optax, SciPy, custom Particle Swarm Optimization (PSO)
-*   **Physics:** ZND Model, JWL EOS, Miller-PDU Kinetic Models, Murnaghan Solid EOS
+*   **Framework:** JAX (with `jax_enable_x64` strictly enabled)
+*   **Optimization:** JAX-PSO + Nelder-Mead (Dual-Refinement)
+*   **Physics:** JCZ3 EOS (with Ree-Ross Polar Correction), Miller-PDU Kinetics (V5), Constrained JWL Fitting
 
 ## Development Environment
 
 ### Setup
 The project adheres to strict environmental isolation using Conda.
-
 *   **Environment Name:** `nnrf`
 *   **Activation:** `mamba activate nnrf`
-*   **Key Dependencies:** `jax`, `jaxlib`, `numpy`, `scipy`, `optax`, `matplotlib`, `pandas`.
 
 ### Directory Structure
 ```
 /home/jcl/HDY/PyDetonation-Ultra/
 ├── pdu/                    # Core source code
-│   ├── api.py              # Main entry point (Afterburning Injection & Q-Anchor logic)
-│   ├── core/               # Equilibrium solvers (implicit differentiation)
-│   ├── physics/            # Physics modules (EOS, Kinetics, JWL)
+│   ├── api.py              # Global Quenching & Heat Sink Logic
+│   ├── core/               # Equilibrium solvers (Schur-RAND)
+│   ├── physics/            # Physics modules
 │   │   ├── kinetics.py     # Thermal Lag & Miller models
-│   │   └── jwl.py          # JWL fitting (6-Param Relaxed PSO + Energy Soft Constraint)
+│   │   ├── jwl.py          # Constrained Physics Fitting (Barrier-based)
+│   │   └── eos.py          # JCZ3 + High-P Energy Correction
 │   └── tests/              # Benchmark suites
 ├── docs/                   # Documentation & Whitepapers
-│   ├── rules.md            # CRITICAL: Development rules & physics mandates
-│   ├── 专家意见.md          # Expert feedback driving V10.5 changes
+│   ├── project_whitepaper.md # Latest V10.6 validation results
+│   ├── 反馈意见.md           # Critical audit feedback driving V10.6
 │   └── *_benchmark.py      # Benchmark scripts
-├── pyproject.toml          # Project configuration
-└── RULES.md                # The authoritative guide for this project
+└── RULES.md                # Authoritative guide
 ```
 
 ## Key Workflows & Commands
 
 ### 1. Benchmark & Validation
-The primary method for verifying physics changes is running the version-specific benchmark script.
 ```bash
-# Current active benchmark (V10.5)
+# Current active benchmark (V10.6 compatible)
 PYTHONPATH=. python pdu/tests/test_v10_5_benchmark.py
 ```
 
-### 2. Physics Mandates (Crucial)
-*   **Precision:** `jax.config.update("jax_enable_x64", True)` is mandatory.
-*   **Thermal Lag:** For aluminized explosives, the "Thermal Lag" model (`kinetics.py`) must be used, freezing aluminum reaction at the CJ plane.
-*   **Afterburning Injection:** Energy from unreacted Al must be injected into the expansion tail ($V > 1.5$) in `api.py` to allow JWL to fit high-work trails.
-*   **Energy Anchor Correctness:** JWL energy target ($E_0$) must be based on **Total Heat of Detonation ($Q \times \rho_0$)** and anchored at the **CJ state ($V_{CJ}$)**, not at $V=1$ or using $U_{form}$.
-*   **6-Param PSO:** Always decouple parameter $C$ from hard energy formulas during optimization to avoid initialization death zones.
+### 2. V10.6 Physics Mandates (Crucial)
+*   **Matrix Quenching:** Energetic matrix must have quenching factors (~0.97) when metals are present.
+*   **JWL Barriers:** $\omega 
+[0.25, 0.45]$ and $B/A < 0.1$ are mandatory to avoid numerical toxins.
+*   **Energy Consistency:** JWL $E_0$ must match the effective mechanical work (Gurney Energy), typically $0.72 \times Q_{theoretical}$ for Al-explosives.
 
-## Current Development Focus (V10.5)
+## Current Development Focus (V10.6)
 
-*   **Objective:** Implement "Expert Feedback" regarding non-ideal detonation and JWL robustness.
-*   **Key Change 1 (Kinetics):** Implemented Thermal Lag ($	au_{ind} \sim \mu s$) to enforce inert Al behavior at the nanosecond CJ plane.
-*   **Key Change 2 (Afterburning):** Added sigmoid-based energy injection for $V \in [1.5, 7.0]$ to simulate late-time work.
-*   **Key Change 3 (JWL Fit):** Overhauled `jwl.py` to use a 6-parameter PSO search with energy and sound-speed soft constraints, successfully preventing parameter collapse and allowing healthy $B$ values.
+*   **Status:** V10.6 Implemented & Validated.
+*   **Achievement:** Successfully pushed JWL parameters back into the physical "topology valley". Corrected Tritonal VOD deficit using energy-sink and matrix-quenching models.
+*   **Next Phase:** V11 "Multi-Phase Discrete Dynamics" to solve P-D decoupling in non-ideal explosives.
