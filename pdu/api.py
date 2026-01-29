@@ -101,7 +101,9 @@ def detonation_forward(
     fractions: List[float],
     density: float,
     verbose: bool = False,
-    jwl_priors: Optional[Dict] = None
+    jwl_priors: Optional[Dict] = None,
+    inert_species: Optional[List[str]] = None,
+    target_energy: Optional[float] = None # GPa (Forced Total Energy Constraint)
 ) -> DetonationResult:
     """正向计算：配方 → 爆轰性能 (V7 High-Fidelity Engine)
     
@@ -112,6 +114,8 @@ def detonation_forward(
         fractions: 质量分数列表 (如 [0.75, 0.25])
         density: 装药密度 (g/cm^3)
         jwl_priors: [可选] 传入文献 JWL 系数作为拟合先验。若不传且系统内有对应组分数据，则自动启用混合先验。
+        inert_species: [可选] V8.7 惰性组分列表。若包含 'Al'，则强制移除 Al2O3 产物，使铝不参与氧化反应。
+        target_energy: [可选] V8.7 强制总能量约束 (GPa)。用于两步法拟合，使惰性计算的 JWL 包含全反应能量。
     """
     
     # 自动先验逻辑
@@ -127,6 +131,8 @@ def detonation_forward(
         density: Charge density (g/cm3)
         verbose: Print debug info
         jwl_priors: Optional dict of JWL priors
+        inert_species: List of species to treat as inert (e.g. ['Al'])
+        target_energy: Optional total energy constraint (GPa)
     Returns:
         DetonationResult
     """
@@ -145,7 +151,15 @@ def detonation_forward(
     from pdu.physics.jwl import fit_jwl_from_isentrope
     
     # 1. 数据准备
-    SPECIES_LIST = ('N2', 'H2O', 'CO2', 'CO', 'C_graphite', 'H2', 'O2', 'OH', 'NO', 'NH3', 'CH4', 'Al', 'Al2O3')
+    # V8.7 Upgrade: Dynamic Species List for Two-Step Calculation
+    base_species = ['N2', 'H2O', 'CO2', 'CO', 'C_graphite', 'H2', 'O2', 'OH', 'NO', 'NH3', 'CH4', 'Al', 'Al2O3']
+    
+    # Handle Inert Al -> Remove Al2O3 from allowed products
+    if inert_species and 'Al' in inert_species:
+        if verbose: print("V8.7 INFO: Inert Al mode enabled. Removing Al2O3 from potential products.")
+        base_species = [s for s in base_species if s != 'Al2O3']
+        
+    SPECIES_LIST = tuple(base_species)
     ELEMENT_LIST = ('C', 'H', 'N', 'O', 'Al')
     atomic_masses = jnp.array([12.011, 1.008, 14.007, 15.999, 26.982])
     
@@ -245,18 +259,30 @@ def detonation_forward(
     # 4. JWL 拟合 (从等熵线，V8.1 增加 Gamma 锚定)
     V_rel = np.array(iso_V) / V0
     E_per_vol = (final_internal_energy / V0) / 1000.0 # GPa (Using Internal Energy)
-    jwl = fit_jwl_from_isentrope(V_rel, np.array(iso_P), density, E_per_vol, float(D), float(P_cj), exp_priors=jwl_priors)
+    jwl = fit_jwl_from_isentrope(
+        V_rel, np.array(iso_P), density, E_per_vol, float(D), float(P_cj), 
+        exp_priors=jwl_priors,
+        constraint_total_energy=target_energy # V8.7 Feature
+    )
     
     # 5. 辅助参数 (爆热、氧平衡、感度)
     # 爆热 Q (MJ/kg) = [U_reactant - U_products] / Mass
     # V8.5 Update: 修正了氧原子索引错误 (使用 'O' 而非 'N')
     # V8.5 Update: 使用内能计算 Q (Consistent with CJ solver)
     
+    # 5. 辅助参数 (爆热、氧平衡、感度)
+    # 爆热 Q (MJ/kg) = [U_reactant - U_products] / Mass
+    
     idx_C = ELEMENT_LIST.index('C') if 'C' in ELEMENT_LIST else -1
     idx_H = ELEMENT_LIST.index('H') if 'H' in ELEMENT_LIST else -1
     idx_O = ELEMENT_LIST.index('O') if 'O' in ELEMENT_LIST else -1
     idx_Al = ELEMENT_LIST.index('Al') if 'Al' in ELEMENT_LIST else -1
     
+    # 判定 Al 是否反应
+    al_is_reactive = True
+    if inert_species and 'Al' in inert_species:
+        al_is_reactive = False
+        
     mol_CO2 = min(atom_vec[idx_C], atom_vec[idx_O] / 2.0) if idx_O >= 0 and idx_C >= 0 else 0.0
     
     remaining_O = atom_vec[idx_O] - 2*mol_CO2 if idx_O >= 0 else 0.0
@@ -266,19 +292,27 @@ def detonation_forward(
     Hf_CO2 = -393.5 * 1000.0 
     Hf_H2O = -241.8 * 1000.0  # gas
     Hf_Al2O3 = -1675.7 * 1000.0
+    Hf_Al_Solid = 0.0
     
     # Convert Product H -> U (assume gas except Al2O3)
-    # U = H - PV = H - nRT = H - 1*RT
-    R = 8.314462618 # J/(mol K)
+    R = 8.314462618
     T = 298.15
     Uf_CO2 = Hf_CO2 - 1.0 * R * T
     Uf_H2O = Hf_H2O - 1.0 * R * T
-    Uf_Al2O3 = Hf_Al2O3 # solid, negligible PV work in formation? Agrees with report.
+    Uf_Al2O3 = Hf_Al2O3 # solid
+    Uf_Al = Hf_Al_Solid # solid
     
-    mol_Al2O3 = atom_vec[idx_Al] / 2.0 if idx_Al >= 0 else 0.0
+    if al_is_reactive:
+        # 假设完全形成 Al2O3 (Standard Q Calculation)
+        mol_Al2O3 = atom_vec[idx_Al] / 2.0 if idx_Al >= 0 else 0.0
+        mol_Al_Inert = 0.0
+    else:
+        # V8.7: Al 不反应，保持单质形态
+        mol_Al2O3 = 0.0
+        mol_Al_Inert = atom_vec[idx_Al] if idx_Al >= 0 else 0.0
     
     # Simple Energy Release based on U
-    U_prod = mol_CO2 * Uf_CO2 + mol_H2O * Uf_H2O + mol_Al2O3 * Uf_Al2O3
+    U_prod = mol_CO2 * Uf_CO2 + mol_H2O * Uf_H2O + mol_Al2O3 * Uf_Al2O3 + mol_Al_Inert * Uf_Al
     
     # Q = U_react - U_prod
     Q = (final_internal_energy - U_prod) / (final_mw / 1000.0) / 1000.0 / 1000.0 # MJ/kg
@@ -298,6 +332,11 @@ def detonation_forward(
     rho_cj = density * (V0 / float(V_cj))
     
     if verbose:
+        print(f"   [PDU V8.7] P_CJ={P_cj:.2f} GPa, D={D:.1f} m/s, Q={Q:.2f} MJ/kg (Al_Reactive={al_is_reactive})")
+        # Print main products
+        # Get product composition from solver result (needs decoding)
+        # Assuming we can't easily print exact solver comp here without more code, 
+        # but macro parameters confirm state.
         print(f"\n=== PDU 爆轰计算结果 (V7 Engine) ===")
         print(f"配方: {dict(zip(components, fractions))}")
         print(f"密度: {density:.3f} g/cm³")
