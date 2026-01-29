@@ -24,7 +24,9 @@ def build_stoichiometry_matrix(species_list, elements):
         'NO': {'N': 1, 'O': 1}, 'OH': {'O': 1, 'H': 1},
         'NH3': {'N': 1, 'H': 3}, 'CH4': {'C': 1, 'H': 4},
         'C_graphite': {'C': 1}, 'Al2O3': {'Al': 2, 'O': 3},
-        'Al': {'Al': 1}
+        'Al': {'Al': 1}, 'AlO': {'Al': 1, 'O': 1}, 
+        'Al2O': {'Al': 2, 'O': 1}, 'AlOH': {'Al': 1, 'O': 1, 'H': 1},
+        'AlO2': {'Al': 1, 'O': 2}
     }
     n_elem = len(elements)
     n_spec = len(species_list)
@@ -71,13 +73,20 @@ def solve_kkt_schur(
 def _equilibrium_loop_body(state, params_static):
     """求解循环体 (V8支持多相)"""
     n, A, b_elem, coeffs, V, T, active_mask, damping, iter_idx, eos_params = state
-    # eps, r_star, alpha, [solid_mask, solid_v0]
+    # eps, r_star, alpha, lambda, [solid_mask, solid_v0], [n_fixed, v0_fixed, e_fixed]
     eps, r_star, alpha = eos_params[:3]
-    solid_mask = eos_params[3] if len(eos_params) > 3 else None
-    solid_v0 = eos_params[4] if len(eos_params) > 4 else None
+    lamb = eos_params[3] if len(eos_params) > 3 else None
+    
+    solid_mask = eos_params[4] if len(eos_params) > 4 else None
+    solid_v0 = eos_params[5] if len(eos_params) > 5 else None
+    
+    # V9 Params
+    n_fixed = eos_params[6] if len(eos_params) > 6 else 0.0
+    v0_fixed = eos_params[7] if len(eos_params) > 7 else 10.0
+    e_fixed = eos_params[8] if len(eos_params) > 8 else 0.0
     
     # 1. 计算化学势 (JCZ3 AutoDiff)
-    mu = compute_chemical_potential_jcz3(n, V, T, coeffs, eps, r_star, alpha, solid_mask, solid_v0)
+    mu = compute_chemical_potential_jcz3(n, V, T, coeffs, eps, r_star, alpha, lamb, solid_mask, solid_v0, n_fixed, v0_fixed, e_fixed)
     
     # 2. 计算残差
     n_64 = to_fp64(n)
@@ -91,8 +100,13 @@ def _equilibrium_loop_body(state, params_static):
     # 4. 更新
     def apply_update(ni, dni):
         factor = jnp.where(dni < 0, 0.9 * ni / (jnp.abs(dni) + 1e-30), 1.0)
-        scale = jnp.minimum(1.0, factor)
-        return ni + damping * scale * dni
+        # Add protection against runaway updates
+        factor = jnp.minimum(factor, 1.0)
+        new_ni = ni + dni * factor * damping
+        new_ni = jnp.maximum(new_ni, 1e-25)
+        # Handle nans explicitly to prevent poisoning
+        new_ni = jnp.nan_to_num(new_ni, nan=1e-25, posinf=1.0, neginf=1e-25)
+        return new_ni
         
     n_new = apply_update(n, dn)
     n_new = jnp.maximum(n_new, 1e-20)
@@ -139,12 +153,16 @@ def solve_equilibrium_fwd(atom_vec, V, T, A, coeffs_all, eos_params):
 def solve_equilibrium_bwd(res, g_n):
     n_star, atom_vec, V, T, A, coeffs, eos_params = res
     eps, r_s, alpha = eos_params[:3]
-    solid_mask = eos_params[3] if len(eos_params) > 3 else None
-    solid_v0 = eos_params[4] if len(eos_params) > 4 else None
+    lamb = eos_params[3] if len(eos_params) > 3 else None
+    solid_mask = eos_params[4] if len(eos_params) > 4 else None
+    solid_v0 = eos_params[5] if len(eos_params) > 5 else None
+    n_fixed = eos_params[6] if len(eos_params) > 6 else 0.0
+    v0_fixed = eos_params[7] if len(eos_params) > 7 else 10.0
+    e_fixed = eos_params[8] if len(eos_params) > 8 else 0.0
     
     from pdu.physics.eos import compute_total_helmholtz_energy
     H_exact = jax.hessian(compute_total_helmholtz_energy, argnums=0)(
-        n_star, V, T, coeffs, eps, r_s, alpha, solid_mask, solid_v0
+        n_star, V, T, coeffs, eps, r_s, alpha, lamb, solid_mask, solid_v0, n_fixed, v0_fixed, e_fixed
     )
     
     H_inv = jax.scipy.linalg.inv(H_exact + 1e-6 * jnp.eye(H_exact.shape[0]))
@@ -169,9 +187,13 @@ def solve_equilibrium_bwd(res, g_n):
     def computed_mu_for_diff(*params):
         # params matches eos_params structure
         e, r, a = params[:3]
-        sm = params[3] if len(params) > 3 else None
-        sv = params[4] if len(params) > 4 else None
-        return compute_chemical_potential_jcz3(n_star, V, T, coeffs, e, r, a, sm, sv)
+        lam = params[3] if len(params) > 3 else None
+        sm = params[4] if len(params) > 4 else None
+        sv = params[5] if len(params) > 5 else None
+        nf = params[6] if len(params) > 6 else 0.0
+        vf = params[7] if len(params) > 7 else 10.0
+        ef = params[8] if len(params) > 8 else 0.0
+        return compute_chemical_potential_jcz3(n_star, V, T, coeffs, e, r, a, lam, sm, sv, nf, vf, ef)
     
     _, vjp_fun = jax.vjp(computed_mu_for_diff, *eos_params)
     

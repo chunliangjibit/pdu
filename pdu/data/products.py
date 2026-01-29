@@ -20,6 +20,9 @@ class ProductData:
     phase: str  # 'gas', 'solid', 'liquid'
     coeffs_high: jnp.ndarray  # 高温多项式系数 (1000-5000 K)
     coeffs_low: jnp.ndarray   # 低温多项式系数 (300-1000 K)
+    # V10: Optional 9-coeff support
+    coeffs_high_9: Optional[jnp.ndarray] = None
+    coeffs_low_9: Optional[jnp.ndarray] = None
     
     def get_coeffs(self, T: float) -> jnp.ndarray:
         """根据温度选择合适的多项式系数
@@ -30,6 +33,9 @@ class ProductData:
         Returns:
             NASA 7系数多项式系数
         """
+        if self.coeffs_high_9 is not None and self.coeffs_low_9 is not None:
+             # Prefer NASA-9 if available
+             return jnp.where(T > 1000.0, self.coeffs_high_9, self.coeffs_low_9)
         return jnp.where(T > 1000.0, self.coeffs_high, self.coeffs_low)
 
 
@@ -72,7 +78,9 @@ def load_products(reload: bool = False) -> Dict[str, ProductData]:
             molecular_weight=data['molecular_weight'],
             phase=data['phase'],
             coeffs_high=jnp.array(data['coeffs_high']),
-            coeffs_low=jnp.array(data['coeffs_low'])
+            coeffs_low=jnp.array(data['coeffs_low']),
+            coeffs_high_9=jnp.array(data['coeffs_high_9']) if 'coeffs_high_9' in data else None,
+            coeffs_low_9=jnp.array(data['coeffs_low_9']) if 'coeffs_low_9' in data else None
         )
     
     _PRODUCTS_CACHE = products

@@ -21,19 +21,18 @@ N_AVOGADRO = 6.02214076e23
 
 @dataclass
 class JCZ3EOS:
-    """JCZ3 状态方程类"""
+    """JCZ3 状态方程类 (Refactored for V10 Dynamic Mixing)"""
     species_names: tuple
-    epsilon_matrix: jnp.ndarray
-    r_star_matrix: jnp.ndarray
-    alpha_matrix: jnp.ndarray
+    # Pure component parameters (Vector form)
+    eps_vec: jnp.ndarray      # epsilon/k (K)
+    r_star_vec: jnp.ndarray   # r* (Angstrom)
+    alpha_vec: jnp.ndarray    # alpha (Repulsive steepness)
+    lambda_vec: jnp.ndarray   # [V10] Francis Ree Polar correction factor (K)
     coeffs_all: jnp.ndarray 
 
     @classmethod
     def from_species_list(cls, species_list: list, coeffs_all: jnp.ndarray) -> "JCZ3EOS":
-        """从物种列表构建 EOS"""
-        from pdu.data.products import get_exp6_params
-        from pdu.physics.potential import build_mixing_matrices
-        
+        """从物种列表构建 EOS (V10 Version)"""
         import json
         import os
         
@@ -45,24 +44,49 @@ class JCZ3EOS:
                 data = json.load(f)
                 db = data.get('species', {})
             
+            vec_eps = []
+            vec_r = []
+            vec_alpha = []
+            vec_lambda = []
+            
             for species in species_list:
                 if species in db:
                     p = db[species]
-                    params[species] = (p['epsilon_over_k'], p['r_star'], p['alpha'])
+                    vec_eps.append(p.get('epsilon_over_k', 100.0))
+                    vec_r.append(p.get('r_star', 3.5))
+                    vec_alpha.append(p.get('alpha', 13.0))
+                    # Check for 'lambda' polar parameter, default 0.0
+                    vec_lambda.append(p.get('lambda_ree', 0.0)) 
                 else:
-                    # Default
-                    params[species] = (100.0, 3.5, 13.0)
-        except:
-             for species in species_list:
-                params[species] = (100.0, 3.5, 13.0)
+                    # Default / Fallback
+                    if species == 'H2O':
+                        # Hardcode V10 Ree parameters for water if missing in DB
+                        # Ree 1982: eps=94.5, r=3.35, alpha=13.5, lambda=5400? (Approx)
+                        # Let's use neutral defaults but allow lambda injection
+                        vec_eps.append(100.0) 
+                        vec_r.append(3.5)
+                        vec_alpha.append(13.0)
+                        vec_lambda.append(0.0) 
+                    else:
+                        vec_eps.append(100.0)
+                        vec_r.append(3.5)
+                        vec_alpha.append(13.0)
+                        vec_lambda.append(0.0)
 
-        eps_matrix, r_matrix, alpha_matrix = build_mixing_matrices(params)
-        
+        except Exception as e:
+             # Fallback if file load fails
+             print(f"Warning: Failed to load JCZ3 DB ({e}), using defaults.")
+             vec_eps = [100.0] * len(species_list)
+             vec_r = [3.5] * len(species_list)
+             vec_alpha = [13.0] * len(species_list)
+             vec_lambda = [0.0] * len(species_list)
+
         return cls(
             species_names=tuple(species_list),
-            epsilon_matrix=eps_matrix,
-            r_star_matrix=r_matrix,
-            alpha_matrix=alpha_matrix,
+            eps_vec=jnp.array(vec_eps),
+            r_star_vec=jnp.array(vec_r),
+            alpha_vec=jnp.array(vec_alpha),
+            lambda_vec=jnp.array(vec_lambda),
             coeffs_all=coeffs_all
         )
 
@@ -120,6 +144,36 @@ def compute_effective_diameter_ratio(T, epsilon, alpha):
     # Clip ratio to reasonable bounds (e.g. 0.4 to 1.2)
     # At T->0, log_term -> -inf, ratio -> large. 
     return jnp.clip(ratio, 0.4, 1.2)
+
+@jax.jit
+def compute_mixed_matrices_dynamic(
+    T: float,
+    eps_vec: jnp.ndarray,
+    r_vec: jnp.ndarray,
+    alpha_vec: jnp.ndarray,
+    lambda_vec: jnp.ndarray
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    [V10 Core] Calculate mixing matrices dynamic with Temperature
+    Supports Francis Ree Correction: eps(T) = eps0 * (1 + lambda/T)
+    """
+    T_safe = jnp.maximum(T, 1e-2)
+    
+    # 1. Apply Ree Correction (Polar Water)
+    eps_T = eps_vec * (1.0 + lambda_vec / T_safe)
+    
+    # 2. Lorentz-Berthelot Mixing
+    # Epsilon: Geometric Mean: sqrt(e_i * e_j)
+    # Outer product equivalent: sqrt(e_i * e_j) = sqrt(outer(e, e))
+    eps_matrix = jnp.sqrt(jnp.outer(eps_T, eps_T))
+    
+    # R_star: Arithmetic Mean: (r_i + r_j) / 2
+    r_matrix = 0.5 * (jnp.expand_dims(r_vec, 1) + jnp.expand_dims(r_vec, 0))
+    
+    # Alpha: Arithmetic Mean: (a_i + a_j) / 2
+    alpha_matrix = 0.5 * (jnp.expand_dims(alpha_vec, 1) + jnp.expand_dims(alpha_vec, 0))
+    
+    return eps_matrix, r_matrix, alpha_matrix
 
 @jax.jit
 def compute_excess_repulsion(
@@ -201,15 +255,20 @@ def compute_total_helmholtz_energy(
     V_total: float,
     T: float,
     coeffs_all: jnp.ndarray,
-    epsilon_matrix: jnp.ndarray,
-    r_star_matrix: jnp.ndarray,
-    alpha_matrix: jnp.ndarray,
-    solid_mask: Optional[jnp.ndarray] = None,   # 1.0=Solid, 0.0=Gas
-    solid_v0: Optional[jnp.ndarray] = None      # 固相摩尔体积 (cm3/mol)
+    # V10 Upgrade: Pass Vectors instead of Matrices
+    eps_vec: jnp.ndarray,
+    r_star_vec: jnp.ndarray,
+    alpha_vec: jnp.ndarray,
+    lambda_vec: jnp.ndarray,
+    solid_mask: Optional[jnp.ndarray] = None,   # 1.0=Solid, 0.0=Gas (in equilibrium)
+    solid_v0: Optional[jnp.ndarray] = None,     # Equilibrium solid molar volume (cm3/mol)
+    n_fixed_solids: Optional[float] = 0.0,      # V9: Moles of fixed inert solid (e.g. Inert Al)
+    v0_fixed_solids: Optional[float] = 10.0,    # V9: Molar volume of fixed inert solid (Al=10.0)
+    e_fixed_solids: Optional[float] = 0.0       # V9: Internal energy contribution of fixed solids (approx)
 ) -> float:
     """
-    V8 核心升级: 多相亥姆霍兹自由能 (气固分离 + 体积扣除)
-    解决了固相产物被当成高压气体处理导致的"能量稀释"问题。
+    V9 Upgrade: Support 'Partial Reaction' by adding fixed inert solids that occupy volume
+    but do not participate in equilibrium (n_fixed_solids).
     """
     n = to_fp64(n)
     V_total = to_fp64(V_total)
@@ -241,10 +300,25 @@ def compute_total_helmholtz_energy(
     # 计算动态有效体积
     solid_vol_eff = compute_solid_volume_murnaghan(solid_v0, P_proxy, is_carbon, is_alumina)
     
-    V_condensed_eff = jnp.sum(n_solid * solid_vol_eff)
-    V_gas_eff = jnp.maximum(V_total - V_condensed_eff, 1e-3)
+    # Equilibrium Solids Volume
+    V_condensed_eq = jnp.sum(n_solid * solid_vol_eff)
+    
+    # Fixed Inert Solids Volume (V9)
+    # Assume fixed solids are incompressible or use Murnaghan with fixed params? 
+    # For Al, K0=76 GPa. Let's use simple Murnaghan for Al here too.
+    # v_inert = v0 * (1 + 4*P/K)^(-1/4)
+    inert_compress = jnp.power(1.0 + 4.0 * P_proxy / 76e9, -1.0/4.0)
+    V_condensed_fixed = n_fixed_solids * v0_fixed_solids * inert_compress
+    
+    V_condensed_total = V_condensed_eq + V_condensed_fixed
+    V_gas_eff = jnp.maximum(V_total - V_condensed_total, 1e-3)
     V_gas_m3 = V_gas_eff * 1e-6
     # === [V8.4 Patch End] ===
+
+    # [V10 Core] Dynamic Mixing Calculation
+    epsilon_matrix, r_star_matrix, alpha_matrix = compute_mixed_matrices_dynamic(
+        T, eps_vec, r_star_vec, alpha_vec, lambda_vec
+    )
 
     # === 4. 气相自由能 (JCZ3 + Ideal Gas) ===
     # (A) 理想气体
@@ -252,10 +326,13 @@ def compute_total_helmholtz_energy(
     u_vec, s0_vec = jax.vmap(get_thermo)(coeffs_all)
     
     P0 = 1e5
-    val_for_log = (n_gas * R * T) / (V_gas_m3 * P0)
-    ln_terms_gas = jnp.log(jnp.maximum(val_for_log, 1e-30))
-    S_correction_gas = -R * jnp.sum(jnp.where(n_gas > 1e-20, n_gas * ln_terms_gas, 0.0))
-    A_gas_ideal = jnp.sum(n_gas * (u_vec - T * s0_vec)) - T * S_correction_gas
+    n_gas_safe = jnp.maximum(n_gas, 1e-15)
+    val_for_log = (n_gas_safe * R * T) / (V_gas_m3 * P0)
+    ln_terms_gas = jnp.log(val_for_log)
+    
+    # Use where to zero out contribution but maintain finite gradient
+    S_term = jnp.where(n_gas > 1e-18, n_gas * ln_terms_gas, 0.0)
+    A_gas_ideal = jnp.sum(n_gas * (u_vec - T * s0_vec)) + R * T * jnp.sum(S_term)
     
     # (B) JCZ3 非理想修正
     B_total_gas = compute_covolume(n_gas, r_star_matrix, T, epsilon_matrix, alpha_matrix)
@@ -306,9 +383,22 @@ def compute_total_helmholtz_energy(
     A_gas_total = A_gas_ideal + A_excess_hs + U_attr + A_rep
 
     # === 5. 固相自由能 ===
-    A_solid = jnp.sum(n_solid * (u_vec - T * s0_vec))
+    # === 5. 固相自由能 ===
+    A_solid_eq = jnp.sum(n_solid * (u_vec - T * s0_vec))
     
-    return A_gas_total + A_solid
+    # Fixed Solids Free Energy (Approximation A = U - TS)
+    # We assume e_fixed_solids gives U contribution (e.g. C_v * T)
+    # Simple approx for Al: Cv = 24.2 J/mol.K
+    # U = Hf + Cv(T-298)
+    # S = S0 + Cv ln(T/298)
+    # A = U - TS
+    # This is getting complex. Let's pass a simplified 'fixed_energy_term' if possible.
+    # For now, simplistic scaling for volume effect is primary.
+    # Energy effect of inert filler is secondary for P_CJ but important for T_CJ.
+    # Let's add simple heat capacity term.
+    A_solid_fixed = n_fixed_solids * (e_fixed_solids + 24.3 * (T - 298.0) - T * (28.3 + 24.3 * jnp.log(T/298.0)))
+    
+    return A_gas_total + A_solid_eq + A_solid_fixed
 
 @jax.jit
 def compute_chemical_potential_jcz3(
@@ -316,14 +406,18 @@ def compute_chemical_potential_jcz3(
     V: float,
     T: float,
     coeffs_all: jnp.ndarray,
-    epsilon_matrix: jnp.ndarray,
-    r_star_matrix: jnp.ndarray,
-    alpha_matrix: jnp.ndarray,
+    eps_vec: jnp.ndarray,
+    r_star_vec: jnp.ndarray,
+    alpha_vec: jnp.ndarray,
+    lambda_vec: jnp.ndarray,
     solid_mask: Optional[jnp.ndarray] = None,
-    solid_v0: Optional[jnp.ndarray] = None
+    solid_v0: Optional[jnp.ndarray] = None,
+    n_fixed_solids: float = 0.0,
+    v0_fixed_solids: float = 10.0,
+    e_fixed_solids: float = 0.0
 ) -> jnp.ndarray:
     grad_fn = jax.grad(compute_total_helmholtz_energy, argnums=0)
-    mu_vec = grad_fn(n, V, T, coeffs_all, epsilon_matrix, r_star_matrix, alpha_matrix, solid_mask, solid_v0)
+    mu_vec = grad_fn(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids)
     return mu_vec
 
 @jax.jit
@@ -331,15 +425,19 @@ def compute_pressure_jcz3(
     n: jnp.ndarray,
     V: float,
     T: float,
-    epsilon_matrix: jnp.ndarray,
-    r_star_matrix: jnp.ndarray,
-    alpha_matrix: jnp.ndarray,
+    coeffs_all: jnp.ndarray,
+    eps_vec: jnp.ndarray,
+    r_star_vec: jnp.ndarray,
+    alpha_vec: jnp.ndarray,
+    lambda_vec: jnp.ndarray,
     solid_mask: Optional[jnp.ndarray] = None,
-    solid_v0: Optional[jnp.ndarray] = None
+    solid_v0: Optional[jnp.ndarray] = None,
+    n_fixed_solids: float = 0.0,
+    v0_fixed_solids: float = 10.0,
+    e_fixed_solids: float = 0.0
 ) -> float:
-    coeffs_dummy = jnp.zeros((n.shape[0], 7))
     grad_fn = jax.grad(compute_total_helmholtz_energy, argnums=1)
-    dA_dV = grad_fn(n, V, T, coeffs_dummy, epsilon_matrix, r_star_matrix, alpha_matrix, solid_mask, solid_v0) 
+    dA_dV = grad_fn(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids) 
     return -dA_dV * 1e6
 
 @jax.jit
@@ -348,15 +446,19 @@ def compute_internal_energy_jcz3(
     V: float,
     T: float,
     coeffs_all: jnp.ndarray,
-    epsilon_matrix: jnp.ndarray,
-    r_star_matrix: jnp.ndarray,
-    alpha_matrix: jnp.ndarray,
+    eps_vec: jnp.ndarray,
+    r_star_vec: jnp.ndarray,
+    alpha_vec: jnp.ndarray,
+    lambda_vec: jnp.ndarray,
     solid_mask: Optional[jnp.ndarray] = None,
-    solid_v0: Optional[jnp.ndarray] = None
+    solid_v0: Optional[jnp.ndarray] = None,
+    n_fixed_solids: float = 0.0,
+    v0_fixed_solids: float = 10.0,
+    e_fixed_solids: float = 0.0
 ) -> float:
     grad_T_fn = jax.grad(compute_total_helmholtz_energy, argnums=2)
-    dA_dT = grad_T_fn(n, V, T, coeffs_all, epsilon_matrix, r_star_matrix, alpha_matrix, solid_mask, solid_v0)
-    A = compute_total_helmholtz_energy(n, V, T, coeffs_all, epsilon_matrix, r_star_matrix, alpha_matrix, solid_mask, solid_v0)
+    dA_dT = grad_T_fn(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids)
+    A = compute_total_helmholtz_energy(n, V, T, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids)
     return A - T * dA_dT
 
 @jax.jit
@@ -365,12 +467,16 @@ def compute_entropy_consistent(
     V: float,
     T: float,
     coeffs_all: jnp.ndarray,
-    epsilon_matrix: jnp.ndarray,
-    r_star_matrix: jnp.ndarray,
-    alpha_matrix: jnp.ndarray,
+    eps_vec: jnp.ndarray,
+    r_star_vec: jnp.ndarray,
+    alpha_vec: jnp.ndarray,
+    lambda_vec: jnp.ndarray,
     solid_mask: Optional[jnp.ndarray] = None,
-    solid_v0: Optional[jnp.ndarray] = None
+    solid_v0: Optional[jnp.ndarray] = None,
+    n_fixed_solids: float = 0.0,
+    v0_fixed_solids: float = 10.0,
+    e_fixed_solids: float = 0.0
 ) -> float:
     def h_wrt_T(t):
-        return compute_total_helmholtz_energy(n, V, t, coeffs_all, epsilon_matrix, r_star_matrix, alpha_matrix, solid_mask, solid_v0)
+        return compute_total_helmholtz_energy(n, V, t, coeffs_all, eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed_solids, v0_fixed_solids, e_fixed_solids)
     return -jax.grad(h_wrt_T)(T)

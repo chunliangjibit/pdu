@@ -56,7 +56,8 @@ def fit_jwl_from_isentrope(
     exp_priors=None,
     constraint_P_cj: float = None,  # GPa
     constraint_D_exp: float = None, # m/s (for Rayleigh line)
-    constraint_total_energy: float = None # GPa (Total Available Energy E0_reactive)
+    constraint_total_energy: float = None, # GPa (Total Available Energy E0_reactive)
+    method: str = 'Nelder-Mead' # 'Nelder-Mead' or 'PSO' (V10 Upgrade)
 ):
     """
     V8.7: Prior-Aware Robust Fitting with Engineering Bias & Total Energy Constraint
@@ -74,7 +75,11 @@ def fit_jwl_from_isentrope(
     P_cj = P_array[0]
     
     # 2. 计算物理目标 Gamma (绝热指数)
-    gamma_cj_target = (rho0 * (D_cj**2) * 1e-6) / P_cj_theory - 1.0 
+    if P_cj_theory < 1e-6:
+        gamma_cj_target = 3.0 # Fallback for failed physics
+        print(f"WARNING: P_cj_theory is zero or invalid ({P_cj_theory}). Using fallback Gamma=3.0")
+    else:
+        gamma_cj_target = (rho0 * (D_cj**2) * 1e-6) / P_cj_theory - 1.0 
     
     # [V8.6] Engineering Constraint Target
     target_P_cj = None
@@ -95,42 +100,45 @@ def fit_jwl_from_isentrope(
             target_V_cj = V_cj_rel
     
     # 3. 对数域数据
-    y_log = np.log(np.maximum(P_array, 1e-4))
+    V_rel_array = jnp.array(V_rel_array)
+    P_array = jnp.array(P_array)
+    y_log = jnp.log(jnp.maximum(P_array, 1e-4))
     
-    # 4. 目标函数
+    # 4. 目标函数 (JAX-compatible for PSO JIT)
     def objective(params):
         A, B, R1, R2, w, C = params
         
         # 物理约束惩罚 (Barrier Method)
-        if A < 0 or B < 0 or C < 0 or w < 0 or w > 1.2 or R1 < (R2 + 1.0) or R2 < 0.1:
-            return 1e9
+        # Combine conditions using bitwise OR for JAX
+        bad = (A < 0) | (B < 0) | (C < 0) | (w < 0) | (w > 1.2) | (R1 < (R2 + 0.5)) | (R2 < 0.1)
+        penalty_barrier = jnp.where(bad, 1e9, 0.0)
         
         # 模型预测 (Isentrope 形式)
-        P_pred = A * np.exp(-R1 * V_rel_array) + \
-                 B * np.exp(-R2 * V_rel_array) + \
-                 C / (V_rel_array**(1.0 + w))
+        P_pred = A * jnp.exp(-R1 * V_rel_array) + \
+                 B * jnp.exp(-R2 * V_rel_array) + \
+                 C / (jnp.maximum(V_rel_array, 1e-4)**(1.0 + w))
         
-        y_pred_log = np.log(np.maximum(P_pred, 1e-6))
+        y_pred_log = jnp.log(jnp.maximum(P_pred, 1e-6))
         
         # (A) Log-MSE Loss
-        loss_fit = np.mean((y_pred_log - y_log)**2) * 50.0
+        loss_fit = jnp.mean((y_pred_log - y_log)**2) * 50.0
         
         # (B) P_CJ Anchor Penalty
         if target_P_cj is not None:
-             P_fit_cj = A * np.exp(-R1 * target_V_cj) + \
-                       B * np.exp(-R2 * target_V_cj) + \
-                       C / (target_V_cj**(1.0 + w))
+             P_fit_cj = A * jnp.exp(-R1 * target_V_cj) + \
+                       B * jnp.exp(-R2 * target_V_cj) + \
+                       C / (jnp.maximum(target_V_cj, 1e-4)**(1.0 + w))
              loss_anchor_P = ((P_fit_cj - target_P_cj) / target_P_cj) ** 2 * 10000.0 
         else:
-             P_fit_cj = A * np.exp(-R1 * V_cj_rel) + \
-                       B * np.exp(-R2 * V_cj_rel) + \
-                       C / (V_cj_rel**(1.0 + w))
+             P_fit_cj = A * jnp.exp(-R1 * V_cj_rel) + \
+                       B * jnp.exp(-R2 * V_cj_rel) + \
+                       C / (jnp.maximum(V_cj_rel, 1e-4)**(1.0 + w))
              loss_anchor_P = ((P_fit_cj - P_cj) / P_cj) ** 2 * 100.0
         
         # (C) Gamma_CJ Anchor Penalty
         if target_P_cj is None:
-            dP_dV = -A * R1 * np.exp(-R1 * V_cj_rel) - \
-                    B * R2 * np.exp(-R2 * V_cj_rel) - \
+            dP_dV = -A * R1 * jnp.exp(-R1 * V_cj_rel) - \
+                    B * R2 * jnp.exp(-R2 * V_cj_rel) - \
                     C * (1.0 + w) * (V_cj_rel**-(2.0 + w))
             gamma_pred = -(V_cj_rel / (P_fit_cj + 1e-6)) * dP_dV
             loss_anchor_Gamma = ((gamma_pred - gamma_cj_target) / gamma_cj_target) ** 2 * 50.0 
@@ -138,20 +146,15 @@ def fit_jwl_from_isentrope(
             loss_anchor_Gamma = 0.0
             
         # (D) Total Energy Constraint [V8.7 Upgrade]
-        # Integral P dV from V_cj to Inf = A/R1 exp(-R1 V) + ...
         loss_energy = 0.0
         if constraint_total_energy is not None:
-            # Calculate Integral Energy for current parameters starting at V_CJ (Inert or Target)
-            # Use target_V_cj if available (Consistent start point)
             V_start = target_V_cj if target_V_cj is not None else V_cj_rel
             
-            term1 = (A / R1) * np.exp(-R1 * V_start)
-            term2 = (B / R2) * np.exp(-R2 * V_start)
-            term3 = (C / w) * (V_start**(-w))
+            term1 = (A / R1) * jnp.exp(-R1 * V_start)
+            term2 = (B / R2) * jnp.exp(-R2 * V_start)
+            term3 = (C / jnp.maximum(w, 1e-3)) * (V_start**(-w))
             
-            E_integral = term1 + term2 + term3 # GPa (Energy density)
-            
-            # Penalty
+            E_integral = term1 + term2 + term3
             loss_energy = ((E_integral - constraint_total_energy) / constraint_total_energy) ** 2 * 5000.0
             
         # (E) Prior Penalty
@@ -164,15 +167,29 @@ def fit_jwl_from_isentrope(
             loss_prior += ((R2 - ep['R2'])/ep['R2'])**2 * 10.0
             loss_prior += ((w - ep['omega'])/ep['omega'])**2 * 10.0
             
-        return loss_fit + loss_anchor_P + loss_anchor_Gamma + loss_energy + loss_prior
+        return loss_fit + loss_anchor_P + loss_anchor_Gamma + loss_energy + loss_prior + penalty_barrier
 
     # 5. 优化准备 (使用先验作为初始值)
     if exp_priors:
         ep = exp_priors
         x0 = [ep['A'], ep['B'], ep['R1'], ep['R2'], ep['omega'], 1.0]
-    else:
-        x0 = [600.0, 15.0, 4.8, 1.2, 0.35, 1.0]
-    
+    if method == 'PSO':
+        from pdu.calibration.pso import PSOOptimizer
+        print(f"[V10 PSO] Running Global Optimization for JWL fitting...")
+        
+        # Define JAX-compatible objective for PSO
+        def pso_obj(p):
+            # p: [A, B, R1, R2, w, C]
+            return objective(p)
+            
+        lb = jnp.array([10.0, 0.1, 1.5, 0.2, 0.05, 0.1])
+        ub = jnp.array([5000.0, 300.0, 15.0, 5.0, 1.5, 50.0])
+        
+        pso = PSOOptimizer(pso_obj, lb, ub, num_particles=100)
+        best_x_pso, best_f_pso = pso.optimize(num_iterations=150)
+        x0 = np.array(best_x_pso)
+        print(f"[V10 PSO] Global search result f={best_f_pso:.6f}. Refining with Nelder-Mead...")
+
     res = minimize(objective, x0, method='Nelder-Mead', tol=1e-6, options={'maxiter': 5000})
     
     A, B, R1, R2, w, C = res.x

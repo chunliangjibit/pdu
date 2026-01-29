@@ -103,11 +103,15 @@ def detonation_forward(
     verbose: bool = False,
     jwl_priors: Optional[Dict] = None,
     inert_species: Optional[List[str]] = None,
-    target_energy: Optional[float] = None # GPa (Forced Total Energy Constraint)
+    target_energy: Optional[float] = None, # GPa (Forced Total Energy Constraint)
+    reaction_degree: Optional[Dict[str, float]] = None, # V9: Partial reaction degree map (e.g. {'Al': 0.15})
+    combustion_efficiency: float = 1.0, # V9: Efficiency reduction (Tritonal fix)
+    fitting_method: str = 'Nelder-Mead' # V10: 'Nelder-Mead' or 'PSO'
 ) -> DetonationResult:
-    """正向计算：配方 → 爆轰性能 (V7 High-Fidelity Engine)
+    """正向计算：配方 → 爆轰性能 (V9 React-Flow Engine)
     
     采用 JCZ3 状态方程、热力学自洽熵 (AD-based) 及全等熵线 JWL 拟合。
+    V9 新增：支持部分反应度 (Partial Reaction) 和燃烧效率修正。
     
     Args:
         components: 组分名称列表 (如 ['HMX', 'TNT'])
@@ -116,6 +120,8 @@ def detonation_forward(
         jwl_priors: [可选] 传入文献 JWL 系数作为拟合先验。若不传且系统内有对应组分数据，则自动启用混合先验。
         inert_species: [可选] V8.7 惰性组分列表。若包含 'Al'，则强制移除 Al2O3 产物，使铝不参与氧化反应。
         target_energy: [可选] V8.7 强制总能量约束 (GPa)。用于两步法拟合，使惰性计算的 JWL 包含全反应能量。
+        reaction_degree: [可选] V9 组分反应度字典。如 {'Al': 0.15} 表示 15% 的 Al 参与反应，85% 为惰性填料。
+        combustion_efficiency: [可选] V9 燃烧效率因子。用于修正非理想炸药的有效做工能量 (Q_eff = Q_theo * eta)。
     """
     
     # 自动先验逻辑
@@ -152,35 +158,74 @@ def detonation_forward(
     
     # 1. 数据准备
     # V8.7 Upgrade: Dynamic Species List for Two-Step Calculation
+    # V8.7 Upgrade: Dynamic Species List for Two-Step Calculation
     base_species = ['N2', 'H2O', 'CO2', 'CO', 'C_graphite', 'H2', 'O2', 'OH', 'NO', 'NH3', 'CH4', 'Al', 'Al2O3']
     
-    # Handle Inert Al -> Remove Al2O3 from allowed products
+    # Handle Inert Al -> Remove Al products (Solids AND Gases)
     if inert_species and 'Al' in inert_species:
-        if verbose: print("V8.7 INFO: Inert Al mode enabled. Removing Al2O3 from potential products.")
-        base_species = [s for s in base_species if s != 'Al2O3']
+        if verbose: print("V8.7 INFO: Inert Al mode enabled. Removing Al products.")
+        base_species = [s for s in base_species if s not in ['Al2O3', 'AlO', 'Al2O']]
+    
+    # V9 Partial Reaction Logic
+    # If partial reaction is set for Al, we need to allow Al2O3 but limit available Al
+    is_partial_al = False
+    if reaction_degree and 'Al' in reaction_degree:
+        is_partial_al = True
+        if verbose: print(f"V9 INFO: Partial Al Reaction Mode. Degree = {reaction_degree['Al']}")
         
     SPECIES_LIST = tuple(base_species)
     ELEMENT_LIST = ('C', 'H', 'N', 'O', 'Al')
     atomic_masses = jnp.array([12.011, 1.008, 14.007, 15.999, 26.982])
     
-    # 加载 V7 JCZ3 参数
+    # 加载 V7 JCZ3 参数 (V10 Update: Load Vectors)
     data_dir = Path(os.path.dirname(__file__)) / 'data'
     with open(data_dir / 'jcz3_params.json') as f:
         v7_params = json.load(f)['species']
         
-    reshaped_p = []
+    vec_eps = []
+    vec_r = []
+    vec_alpha = []
+    vec_lambda = []
+    
     for s in SPECIES_LIST:
-        p = v7_params[s]
-        reshaped_p.append([p['epsilon_over_k'], p['r_star'], p['alpha']])
-    reshaped_p = jnp.array(reshaped_p)
+        if s in v7_params:
+            p = v7_params[s]
+            vec_eps.append(p.get('epsilon_over_k', 100.0))
+            vec_r.append(p.get('r_star', 3.5))
+            vec_alpha.append(p.get('alpha', 13.0))
+            vec_lambda.append(p.get('lambda_ree', 0.0))
+        else:
+            # Fallback (e.g. for AlO/Al2O if not in DB)
+            if verbose: print(f"WARNING: Species {s} not in JCZ3 DB. Using defaults.")
+            vec_eps.append(150.0)
+            vec_r.append(3.6)
+            vec_alpha.append(13.0)
+            vec_lambda.append(0.0)
+            
+    eps_vec = jnp.array(vec_eps)
+    r_vec = jnp.array(vec_r)
+    alpha_vec = jnp.array(vec_alpha)
+    lambda_vec = jnp.array(vec_lambda)
     
-    eps_matrix = jnp.sqrt(jnp.outer(reshaped_p[:,0], reshaped_p[:,0]))
-    r_matrix = (jnp.expand_dims(reshaped_p[:,1], 1) + jnp.expand_dims(reshaped_p[:,1], 0)) / 2.0
-    alpha_matrix = jnp.sqrt(jnp.outer(reshaped_p[:,2], reshaped_p[:,2]))
-    
-    # 加载 NASA 系数
+    # 加载 NASA 系数 (V10 Update: Support 9-coeff with compatibility padding)
     products_db = load_products()
-    coeffs_all = jnp.stack([products_db[s].coeffs_high[:7] if s in products_db else jnp.zeros(7) for s in SPECIES_LIST])
+    coeff_list = []
+    for s in SPECIES_LIST:
+        if s in products_db:
+            p = products_db[s]
+            # Use 9-coeff if available (ProductData stores optional coeffs_high_9)
+            if p.coeffs_high_9 is not None:
+                coeff_list.append(p.coeffs_high_9)
+            else:
+                # Pad NASA-7 to length 9 so JAX can stack them. 
+                # (a1...a7) -> (0, 0, a1...a7) correctly aligns with NASA-9 formula for Cp, H, S.
+                c7 = p.coeffs_high[:7]
+                c9 = jnp.concatenate([jnp.zeros(2), c7])
+                coeff_list.append(c9)
+        else:
+            coeff_list.append(jnp.zeros(9))
+            
+    coeffs_all = jnp.stack(coeff_list)
     A_matrix = build_stoichiometry_matrix(SPECIES_LIST, ELEMENT_LIST)
     
     # 气固分离定义 (V8 升级)
@@ -237,7 +282,31 @@ def detonation_forward(
         equiv_mw += w * comp.molecular_weight
     
     # 归一化为 1 摩尔等效物质
+    
+    # V9: Split atoms into Active and Inert fractions
     atom_vec = jnp.array([equiv_formula[e] / total_moles for e in ELEMENT_LIST])
+    atom_vec_active = jnp.array(atom_vec) # Default full active
+    n_fixed_inert_val = 0.0
+    v0_fixed_inert_val = 10.0 # Default Al
+    e_fixed_inert_val = 0.0
+    
+    if is_partial_al:
+        idx_Al = ELEMENT_LIST.index('Al')
+        total_al_moles = atom_vec[idx_Al]
+        degree = reaction_degree.get('Al', 1.0)
+        
+        mol_active = total_al_moles * degree
+        mol_inert = total_al_moles * (1.0 - degree)
+        
+        # Update active atom vector (reduce Al available for equilibrium)
+        atom_vec_active = atom_vec_active.at[idx_Al].set(mol_active)
+        
+        # Set fixed inert parameters
+        n_fixed_inert_val = mol_inert
+        v0_fixed_inert_val = 10.0 # cm3/mol for Al
+        # simple energy approx (Cv * T_ref) ? Just leave 0 for reference state.
+        
+    # 归一化为 1 摩尔等效物质
     final_hof = equiv_hof / total_moles  # J/mol (Enthalpy)
     final_internal_energy = equiv_internal_energy / total_moles # J/mol (Internal Energy)
     
@@ -247,22 +316,35 @@ def detonation_forward(
     V0 = final_mw / (density * 1.0) # V = M/rho
     E0 = final_internal_energy
     
+    if verbose and is_partial_al:
+        print(f"   -> V0={V0:.2f}, E0={E0:.2f}")
+    
     # 3. 核心计算 (JCZ3 V7)
     if verbose: print(f"Executing V7 High-Fidelity calculation for {components} at rho={density}...")
     
     D, P_cj, T_cj, V_cj, iso_V, iso_P, _ = predict_cj_with_isentrope(
-        eps_matrix, r_matrix, alpha_matrix,
-        V0, E0, atom_vec, coeffs_all, A_matrix, atomic_masses, 30,
-        solid_mask, solid_v0
+        eps_vec, r_vec, alpha_vec, lambda_vec,
+        V0, E0, atom_vec_active, coeffs_all, A_matrix, atomic_masses, 30,
+        solid_mask, solid_v0,
+        n_fixed_inert=n_fixed_inert_val,
+        v0_fixed_inert=v0_fixed_inert_val,
+        e_fixed_inert=e_fixed_inert_val
     )
     
     # 4. JWL 拟合 (从等熵线，V8.1 增加 Gamma 锚定)
     V_rel = np.array(iso_V) / V0
     E_per_vol = (final_internal_energy / V0) / 1000.0 # GPa (Using Internal Energy)
+
+    constraint_E = target_energy
+    if constraint_E is not None and combustion_efficiency < 1.0:
+        if verbose: print(f"V9 INFO: Applying Combustion Efficiency {combustion_efficiency} to Target Energy.")
+        constraint_E *= combustion_efficiency
+        
     jwl = fit_jwl_from_isentrope(
         V_rel, np.array(iso_P), density, E_per_vol, float(D), float(P_cj), 
         exp_priors=jwl_priors,
-        constraint_total_energy=target_energy # V8.7 Feature
+        constraint_total_energy=constraint_E, # V8.7 Feature + V9 Efficiency
+        method=fitting_method                 # V10 PSO Upgrade
     )
     
     # 5. 辅助参数 (爆热、氧平衡、感度)

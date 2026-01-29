@@ -13,10 +13,11 @@
       "alpha": 13.0
     },
     "H2O": {
-      "note": "JCZS3 Expert Calibration (Spherical Approx)",
+      "note": "JCZS3 Expert Calibration (Spherical Approx). V10: Supports Francis Ree Correction.",
       "epsilon_over_k": 333.0,
       "r_star": 3.27,
-      "alpha": 13.0
+      "alpha": 13.0,
+      "lambda_ree": 1500.0
     },
     "CO": {
       "epsilon_over_k": 108.0,
@@ -53,15 +54,36 @@
       "r_star": 3.31,
       "alpha": 14.0
     },
-    "Al": {
-      "epsilon_over_k": 2000.0,
-      "r_star": 4.50,
-      "alpha": 14.0
-    },
     "C_graphite": {
       "epsilon_over_k": 30.6,
       "r_star": 3.50,
       "alpha": 12.0
+    },
+    "Al": {
+      "epsilon_over_k": 500.0,
+      "r_star": 2.6,
+      "alpha": 13.0,
+      "note": "Solid Al fallback"
+    },
+    "AlO": {
+      "epsilon_over_k": 450.0,
+      "r_star": 3.4,
+      "alpha": 13.0
+    },
+    "Al2O": {
+      "epsilon_over_k": 600.0,
+      "r_star": 3.8,
+      "alpha": 13.0
+    },
+    "AlO2": {
+      "epsilon_over_k": 550.0,
+      "r_star": 3.5,
+      "alpha": 13.0
+    },
+    "AlOH": {
+      "epsilon_over_k": 500.0,
+      "r_star": 3.5,
+      "alpha": 13.0
     },
     "Al2O3": {
       "epsilon_over_k": 5000.0,

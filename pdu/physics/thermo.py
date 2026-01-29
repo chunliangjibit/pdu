@@ -15,46 +15,85 @@ from pdu.utils.precision import R_GAS, to_fp64
 
 @jax.jit
 def compute_cp(coeffs: jnp.ndarray, T: float) -> float:
-    """计算定压热容 Cp
+    """计算定压热容 Cp (支持 NASA 7 和 NASA 9)
     
-    NASA 多项式:
+    NASA 7 (len=7):
     Cp/R = a1 + a2*T + a3*T^2 + a4*T^3 + a5*T^4
     
+    NASA 9 (len=9):
+    Cp/R = a1*T^-2 + a2*T^-1 + a3 + a4*T + a5*T^2 + a6*T^3 + a7*T^4
+    
     Args:
-        coeffs: NASA 7系数 [a1, a2, a3, a4, a5, a6, a7]
+        coeffs: NASA 系数数组
         T: 温度 (K)
         
     Returns:
         Cp (J/(mol·K))
     """
     T = to_fp64(jnp.asarray(T))
-    a1, a2, a3, a4, a5, a6, a7 = coeffs
     
-    cp_over_r = a1 + a2*T + a3*T**2 + a4*T**3 + a5*T**4
+    # Branch based on coefficient length
+    # Note: JIT requires static shape branching usually, but here we can try dynamic slice or passed length
+    # However, since we stack coeffs, they must be uniform.
+    # We assume the user passes a uniform array.
+    # To support both in the same JIT, we might need to pad 7 to 9 or use a flag.
+    # For now, let's implement the formula using 'where' or assume a specific version for the whole batch.
     
-    return R_GAS * cp_over_r
+    # Implementation for single call (not batched inside):
+    # Determine mode by shape? 
+    # Inside JIT, shape is static.
+    
+    def _cp_7(c, t):
+        return c[0] + c[1]*t + c[2]*t**2 + c[3]*t**3 + c[4]*t**4
+
+    def _cp_9(c, t):
+        t_inv = 1.0 / t
+        t_inv2 = t_inv * t_inv
+        return c[0]*t_inv2 + c[1]*t_inv + c[2] + c[3]*t + c[4]*t**2 + c[5]*t**3 + c[6]*t**4
+
+    # Using lax.cond based on size is tricky if compiled with fixed size.
+    # We use a hack: if c[8] exists, use 9.
+    # This requires input to always be size 9 if we want 9 support.
+    # If standard is 7, we can't just index 8.
+    
+    # STRATEGY: We will assume all Coefficients are upgraded to 9-element vectors in V10.
+    # For legacy 7-coeff data, we must convert/pad them to a 9-coeff "compatible" form? 
+    # No, the functional forms are different ($T^{-2}$ vs $T^0$).
+    # Better: Update the function to strictly check shape[0]
+    
+    # Since this is a scalar function (single coeffs array), shape is available at trace time.
+    if coeffs.shape[0] == 9:
+        val = _cp_9(coeffs, T)
+    else:
+        val = _cp_7(coeffs, T)
+        
+    return R_GAS * val
 
 
 @jax.jit
 def compute_enthalpy(coeffs: jnp.ndarray, T: float) -> float:
-    """计算摩尔焓 H
-    
-    NASA 多项式:
-    H/(R*T) = a1 + a2*T/2 + a3*T^2/3 + a4*T^3/4 + a5*T^4/5 + a6/T
-    
-    Args:
-        coeffs: NASA 7系数 [a1, a2, a3, a4, a5, a6, a7]
-        T: 温度 (K)
-        
-    Returns:
-        H (J/mol)
-    """
+    """计算摩尔焓 H (支持 NASA 7 和 NASA 9)"""
     T = to_fp64(jnp.asarray(T))
-    a1, a2, a3, a4, a5, a6, a7 = coeffs
     
-    h_over_rt = (a1 + a2*T/2.0 + a3*T**2/3.0 + a4*T**3/4.0 + 
-                 a5*T**4/5.0 + a6/T)
-    
+    def _h_7(c, t):
+        # H/RT = a1 + a2*T/2 + ... + a6/T
+        return c[0] + c[1]*t/2.0 + c[2]*t**2/3.0 + c[3]*t**3/4.0 + c[4]*t**4/5.0 + c[5]/t
+
+    def _h_9(c, t):
+        # H/RT = -a1*T^-2 + a2*T^-1*lnT + a3 + a4*T/2 + ... + a8/T
+        t_inv = 1.0 / t
+        t_inv2 = t_inv * t_inv
+        term1 = -c[0] * t_inv2
+        term2 = c[1] * t_inv * jnp.log(t)
+        poly = c[2] + c[3]*t/2.0 + c[4]*t**2/3.0 + c[5]*t**3/4.0 + c[6]*t**4/5.0
+        const = c[7] * t_inv
+        return term1 + term2 + poly + const
+
+    if coeffs.shape[0] == 9:
+        h_over_rt = _h_9(coeffs, T)
+    else:
+        h_over_rt = _h_7(coeffs, T)
+        
     return R_GAS * T * h_over_rt
 
 
@@ -78,24 +117,29 @@ def compute_internal_energy(coeffs: jnp.ndarray, T: float) -> float:
 
 @jax.jit
 def compute_entropy(coeffs: jnp.ndarray, T: float) -> float:
-    """计算摩尔熵 S
-    
-    NASA 多项式:
-    S/R = a1*ln(T) + a2*T + a3*T^2/2 + a4*T^3/3 + a5*T^4/4 + a7
-    
-    Args:
-        coeffs: NASA 7系数 [a1, a2, a3, a4, a5, a6, a7]
-        T: 温度 (K)
-        
-    Returns:
-        S (J/(mol·K))
-    """
+    """计算摩尔熵 S (支持 NASA 7 和 NASA 9)"""
     T = to_fp64(jnp.asarray(T))
-    a1, a2, a3, a4, a5, a6, a7 = coeffs
     
-    s_over_r = (a1*jnp.log(T) + a2*T + a3*T**2/2.0 + 
-                a4*T**3/3.0 + a5*T**4/4.0 + a7)
-    
+    def _s_7(c, t):
+        # S/R = a1*lnT + a2*T + ... + a7
+        return c[0]*jnp.log(t) + c[1]*t + c[2]*t**2/2.0 + c[3]*t**3/3.0 + c[4]*t**4/4.0 + c[6]
+
+    def _s_9(c, t):
+        # S/R = -a1*T^-2/2 - a2*T^-1 + a3*lnT + a4*T + ... + a9
+        t_inv = 1.0 / t
+        t_inv2 = t_inv * t_inv
+        term1 = -c[0] * t_inv2 / 2.0
+        term2 = -c[1] * t_inv
+        log_term = c[2] * jnp.log(t)
+        poly = c[3]*t + c[4]*t**2/2.0 + c[5]*t**3/3.0 + c[6]*t**4/4.0
+        const = c[8]
+        return term1 + term2 + log_term + poly + const
+
+    if coeffs.shape[0] == 9:
+        s_over_r = _s_9(coeffs, T)
+    else:
+        s_over_r = _s_7(coeffs, T)
+        
     return R_GAS * s_over_r
 
 
