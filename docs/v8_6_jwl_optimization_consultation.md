@@ -154,5 +154,25 @@ vol_c = 4.44 * c_compress # V0 = 4.44 cc/mol (Liquid)
 | **TNT** | 464.1 (+25.0%) | 2.9 (-8.8%) | 4.30 (+3.7%) | 0.97 (+2.1%) | 0.30 (-0.6%) |
 | **PBXN-109** | **758.5 (+61.4%)** | **8.7 (+74.9%)** | 4.82 (+7.1%) | 1.49 (+24.2%) | 0.25 (-1.2%) |
 
+### 6.4 JWL 工程偏置拟合 (pdu/physics/jwl.py)
+针对工程上对 Experimental CJ Point 的刚性需求，我们实施了 Lagrange 约束锚定。
+
+```python
+# [pdu/physics/jwl.py] Engineering Bias Implementation
+# 1. Calculate Target Volume on Rayleigh Line
+term = (constraint_P_cj * 1e9) / (rho0 * (constraint_D_exp**2))
+target_V_cj = 1.0 - term
+target_P_cj = constraint_P_cj
+
+# 2. Penalty in Objective Function
+# If Engineering Constraint is active, force curve through (target_V_cj, target_P_cj)
+if target_P_cj is not None:
+     P_fit_cj = A * np.exp(-R1 * target_V_cj) + \
+               B * np.exp(-R2 * target_V_cj) + \
+               C / (target_V_cj**(1.0 + w))
+     # Strong penalty weight (10000.0) forces alignment
+     loss_anchor_P = ((P_fit_cj - target_P_cj) / target_P_cj) ** 2 * 10000.0 
+```
+
 ## 5. 结论
-PDU V8.6 在理想炸药领域已臻化境，但在非理想（含铝）领域仍面临“过于理想化”带来的模型失真。我们急需一套针对含铝体系的 **JWL 修正策略**，以平抑过剩的计算能量，输出具备工程实用价值的参数。
+PDU V8.6 在理想炸药领域已建立了相对稳固的物理基准，但面对含铝体系（如 PBXN-109）时，现有的平衡态假设显露出明显的局限性。当前模型虽然能够通过参数调整复现部分爆轰参数，但在能量释放机制的解释上仍存在不确定性。我们期待通过本次咨询，获得针对非理想爆轰建模的专业建议，以进一步完善物理引擎的适用范围。
