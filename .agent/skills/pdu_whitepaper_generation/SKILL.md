@@ -129,13 +129,18 @@ Example: `778.0 / 750.0 (+3.7%)`
 
 ---
 
-## 四、误差超过 10% 的参数统计
+### 4. 误差超过 10% 的参数统计
 
 ### 4.1 统计汇总
 [Summary table of counts]
 
 ### 4.2 红色警戒级 (|Error| > 30%)
 [List of critical errors with related code module]
+
+**CRITICAL INSTRUCTION**: You MUST subdivide this section into:
+1.  **Physical Performance Deviations** (e.g., $P_{CJ}$, $Q$): Errors here imply physics model issues.
+2.  **JWL Parameter Deviations** (e.g., $A, B$): Errors here imply fitting baseline differences or mathematical non-uniqueness. You MUST explicitly list the JWL parameter errors here if they exceed 30%.
+    *   Example: `HMX JWL B (+1314%): Predicted 100.0 vs Ref 7.1`.
 
 ### 4.3 黄色警示级 (|Error| 10%-30%)
 [List of warning errors]
@@ -144,7 +149,9 @@ Example: `778.0 / 750.0 (+3.7%)`
 
 ## 五、关键问题分析与咨询课题
 
-[Detailed analysis sections for major issues like: Aluminum Pressure Underestimation, Heat Release Overestimation, JWL Parameter Drift, Liquid Explosive Temperature, etc.]
+[Detailed analysis sections]
+
+**MANDATORY QUESTION**: If JWL parameters show massive deviations (e.g. >100% on A/B) despite good physical performance (sound speed, energy), you MUST formulate a specific consultation question about "Parameter Non-Uniqueness" and "Engineering Applicability" (e.g., "Do high-B parameters cause instability in hydrocodes?").
 
 ---
 

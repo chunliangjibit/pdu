@@ -415,7 +415,82 @@ def detonation_forward(
     
     # 4. JWL 拟合 (从等熵线，V8.1 增加 Gamma 锚定)
     V_rel = np.array(iso_V) / V0
-    E_per_vol = (final_internal_energy / V0) / 1000.0 # GPa (Using Internal Energy)
+    P_data_fit = np.array(iso_P)
+    
+    # [V10.5 Afterburning Injection]
+    # 如果存在未反应的铝粉 (且不是 Inert Al 模式)，手动模拟膨胀过程中的能量释放
+    # 物理逻辑: 
+    # V < 1.5: 惰性 (Thermal Lag)
+    # V > 1.5: 开始燃烧
+    # P_new = P_old * (1 + Gain * Sigmoid(V))
+    # 典型增益: 20% Al -> 30% Impulse Gain -> Integrated P increase implies local P increase
+    
+    # 检查是否含铝且未被完全视为惰性 (Inert species list)
+    has_active_al = ('Al' in components) and (not (inert_species and 'Al' in inert_species))
+    
+    if has_active_al:
+        idx_Al_local = ELEMENT_LIST.index('Al')
+        total_al_frac = atom_vec[idx_Al_local] * atomic_masses[idx_Al_local] / final_mw # Mass Fraction
+        
+        # 只有当 CJ 处反应度较低时才注入后燃 (否则能量已经释放了)
+        if miller_degree < 0.5:
+            if verbose: print(f"V10.5 Afterburning: Injecting Al energy into expansion trail (Al_Mass={total_al_frac:.2%})...")
+            
+            # 增益因子: 20% Al -> max 40% pressure boost at late times
+            # Gain ~ 2.0 * Al_fraction
+            max_gain = 2.0 * total_al_frac 
+            
+            # 作用区间 V: 1.5 -> 6.0
+            def afterburn_boost(v_rel):
+                # Smooth step function 0 -> 1
+                x = (v_rel - 1.5) / 2.0 
+                activation = 1.0 / (1.0 + np.exp(-4.0 * (x - 0.5))) # Sigmoid centered at V=2.5 roughly
+                # Cutoff for V < 1.2 to protect CJ state
+                activation = np.where(v_rel < 1.2, 0.0, activation)
+                return 1.0 + max_gain * activation
+            
+            P_data_fit = P_data_fit * afterburn_boost(V_rel)
+
+    # [V10.5 Critical Fix] Pre-calculate Q for JWL Energy Anchor
+    # ---------------------------------------------------------
+    idx_C = ELEMENT_LIST.index('C') if 'C' in ELEMENT_LIST else -1
+    idx_H = ELEMENT_LIST.index('H') if 'H' in ELEMENT_LIST else -1
+    idx_O = ELEMENT_LIST.index('O') if 'O' in ELEMENT_LIST else -1
+    idx_Al = ELEMENT_LIST.index('Al') if 'Al' in ELEMENT_LIST else -1
+    
+    al_is_reactive = True
+    if inert_species and 'Al' in inert_species: al_is_reactive = False
+        
+    mol_CO2 = min(atom_vec[idx_C], atom_vec[idx_O] / 2.0) if idx_O >= 0 and idx_C >= 0 else 0.0
+    remaining_O = atom_vec[idx_O] - 2*mol_CO2 if idx_O >= 0 else 0.0
+    mol_H2O = min(atom_vec[idx_H] / 2.0, max(0.0, remaining_O)) if idx_H >= 0 else 0.0
+    
+    Hf_CO2, Hf_H2O, Hf_Al2O3, Hf_Al_Solid = -393.5e3, -241.8e3, -1675.7e3, 0.0
+    R_gas, T_ref = 8.314462618, 298.15
+    Uf_CO2, Uf_H2O = Hf_CO2 - R_gas*T_ref, Hf_H2O - R_gas*T_ref
+    Uf_Al2O3, Uf_Al = Hf_Al2O3, Hf_Al_Solid
+
+    if al_is_reactive:
+        mol_Al2O3_max = atom_vec[idx_Al] / 2.0 if idx_Al >= 0 else 0.0
+        if idx_Al >= 0:
+            T_freeze = compute_freeze_out_temperature(float(P_cj))
+            eta_release = compute_effective_heat_release_factor(float(T_cj), T_freeze)
+        else:
+            eta_release = 1.0
+        mol_Al2O3 = mol_Al2O3_max * eta_release
+        mol_Al_Inert = (mol_Al2O3_max - mol_Al2O3) * 2.0
+    else:
+        mol_Al2O3 = 0.0
+        mol_Al_Inert = atom_vec[idx_Al] if idx_Al >= 0 else 0.0
+    
+    U_prod = mol_CO2*Uf_CO2 + mol_H2O*Uf_H2O + mol_Al2O3*Uf_Al2O3 + mol_Al_Inert*Uf_Al
+    Q_val = (final_internal_energy - U_prod) / (final_mw / 1000.0) / 1e6 
+    Q_val = abs(float(Q_val))
+
+    # E_per_vol = Q (MJ/kg) * density (g/cm3) = GPa
+    E_per_vol = Q_val * density
+    if verbose: print(f"V10.5 Energy Anchor: Q={Q_val:.2f} MJ/kg -> E0={E_per_vol:.2f} GPa")
+    # ---------------------------------------------------------
 
     constraint_E = target_energy
     if constraint_E is not None and combustion_efficiency < 1.0:
@@ -423,7 +498,7 @@ def detonation_forward(
         constraint_E *= combustion_efficiency
         
     jwl = fit_jwl_from_isentrope(
-        V_rel, np.array(iso_P), density, E_per_vol, float(D), float(P_cj), 
+        V_rel, P_data_fit, density, E_per_vol, float(D), float(P_cj), 
         exp_priors=jwl_priors,
         constraint_total_energy=constraint_E, # V8.7 Feature + V9 Efficiency
         method=fitting_method                 # V10 PSO Upgrade
@@ -435,69 +510,8 @@ def detonation_forward(
     # V8.5 Update: 使用内能计算 Q (Consistent with CJ solver)
     
     # 5. 辅助参数 (爆热、氧平衡、感度)
-    # 爆热 Q (MJ/kg) = [U_reactant - U_products] / Mass
-    
-    idx_C = ELEMENT_LIST.index('C') if 'C' in ELEMENT_LIST else -1
-    idx_H = ELEMENT_LIST.index('H') if 'H' in ELEMENT_LIST else -1
-    idx_O = ELEMENT_LIST.index('O') if 'O' in ELEMENT_LIST else -1
-    idx_Al = ELEMENT_LIST.index('Al') if 'Al' in ELEMENT_LIST else -1
-    
-    # 判定 Al 是否反应
-    al_is_reactive = True
-    if inert_species and 'Al' in inert_species:
-        al_is_reactive = False
-        
-    mol_CO2 = min(atom_vec[idx_C], atom_vec[idx_O] / 2.0) if idx_O >= 0 and idx_C >= 0 else 0.0
-    
-    remaining_O = atom_vec[idx_O] - 2*mol_CO2 if idx_O >= 0 else 0.0
-    mol_H2O = min(atom_vec[idx_H] / 2.0, max(0.0, remaining_O)) if idx_H >= 0 else 0.0
-    
-    # Enthalpies of formation (J/mol)
-    Hf_CO2 = -393.5 * 1000.0 
-    Hf_H2O = -241.8 * 1000.0  # gas
-    Hf_Al2O3 = -1675.7 * 1000.0
-    Hf_Al_Solid = 0.0
-    
-    # Convert Product H -> U (assume gas except Al2O3)
-    R = 8.314462618
-    T = 298.15
-    Uf_CO2 = Hf_CO2 - 1.0 * R * T
-    Uf_H2O = Hf_H2O - 1.0 * R * T
-    Uf_Al2O3 = Hf_Al2O3 # solid
-    Uf_Al = Hf_Al_Solid # solid
-    
-    if al_is_reactive:
-        # V10.4 Upgrade (P0-2): 冻结温度截止修正
-        # 即使铝粉完全反应，如果 T < T_freeze，其能量也不能计入有效爆热
-        # 典型 T_freeze = 1650 K
-        
-        # 1. 计算理论最大生成量
-        mol_Al2O3_max = atom_vec[idx_Al] / 2.0 if idx_Al >= 0 else 0.0
-        
-        # 2. 计算有效释放系数
-        if idx_Al >= 0:
-            T_freeze = compute_freeze_out_temperature(float(P_cj))
-            eta_release = compute_effective_heat_release_factor(float(T_cj), T_freeze)
-            if verbose: print(f"V10.4 Freeze-Out: T_freeze={T_freeze:.0f}K, eta={eta_release:.3f}")
-        else:
-            eta_release = 1.0
-            
-        # 3. 修正 Al2O3 生成量 (能量意义上)
-        mol_Al2O3 = mol_Al2O3_max * eta_release
-        
-        # 4. 剩余的 Al 视为惰性 (未完全氧化或能量冻结)
-        mol_Al_Inert = (mol_Al2O3_max - mol_Al2O3) * 2.0
-    else:
-        # V8.7: Al 不反应，保持单质形态
-        mol_Al2O3 = 0.0
-        mol_Al_Inert = atom_vec[idx_Al] if idx_Al >= 0 else 0.0
-    
-    # Simple Energy Release based on U
-    U_prod = mol_CO2 * Uf_CO2 + mol_H2O * Uf_H2O + mol_Al2O3 * Uf_Al2O3 + mol_Al_Inert * Uf_Al
-    
-    # Q = U_react - U_prod
-    Q = (final_internal_energy - U_prod) / (final_mw / 1000.0) / 1000.0 / 1000.0 # MJ/kg
-    Q = abs(float(Q))
+    # 爆热 Q 已经预计算为 Q_val
+    Q = Q_val
     
     # 氧平衡
     from pdu.physics.sensitivity import compute_oxygen_balance
