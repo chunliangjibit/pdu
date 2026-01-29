@@ -108,11 +108,35 @@ def fit_jwl_from_isentrope(
     def objective(params):
         A, B, R1, R2, w, C = params
         
-        # 物理约束惩罚 (Barrier Method)
-        # Combine conditions using bitwise OR for JAX
+        # ========== V10.2 增强物理约束 ==========
+        # 基础参数范围约束
         bad = (A < 0) | (B < 0) | (C < 0) | (w < 0) | (w > 1.2) | (R1 < (R2 + 0.5)) | (R2 < 0.1)
         penalty_barrier = jnp.where(bad, 1e9, 0.0)
         
+        # (F) 声速正定性检查: c² = -V² * dP/dV > 0
+        def check_sound_speed(V):
+            dP_dV = -A * R1 * jnp.exp(-R1 * V) - \
+                    B * R2 * jnp.exp(-R2 * V) - \
+                    C * (1.0 + w) * (V**-(2.0 + w))
+            c_squared = -V**2 * dP_dV
+            return c_squared
+        
+        # 在多个体积点检查声速
+        V_check_points = jnp.array([0.6, 0.8, 1.0, 1.5, 2.0, 3.0, 5.0])
+        c2_values = jax.vmap(check_sound_speed)(V_check_points)
+        sound_speed_penalty = jnp.sum(jnp.where(c2_values < 0, 1e8, 0.0))
+        
+        # (G) 曲率约束: d²P/dV² > 0 (凸性)
+        def check_curvature(V):
+            d2P_dV2 = A * R1**2 * jnp.exp(-R1 * V) + \
+                      B * R2**2 * jnp.exp(-R2 * V) + \
+                      C * (1.0 + w) * (2.0 + w) * (V**-(3.0 + w))
+            return d2P_dV2
+        
+        curvature_values = jax.vmap(check_curvature)(V_check_points)
+        curvature_penalty = jnp.sum(jnp.where(curvature_values < 0, 1e7, 0.0))
+        
+        # ========== 原有约束 ==========
         # 模型预测 (Isentrope 形式)
         P_pred = A * jnp.exp(-R1 * V_rel_array) + \
                  B * jnp.exp(-R2 * V_rel_array) + \
@@ -120,8 +144,13 @@ def fit_jwl_from_isentrope(
         
         y_pred_log = jnp.log(jnp.maximum(P_pred, 1e-6))
         
-        # (A) Log-MSE Loss
-        loss_fit = jnp.mean((y_pred_log - y_log)**2) * 50.0
+        # (A) Log-MSE Loss - V10.2: 分段权重
+        # 高压区 (V < 1.2): 权重 2.0
+        # 中压区 (1.2 <= V < 3.0): 权重 1.5
+        # 低压区 (V >= 3.0): 权重 1.0
+        weights = jnp.where(V_rel_array < 1.2, 2.0,
+                           jnp.where(V_rel_array < 3.0, 1.5, 1.0))
+        loss_fit = jnp.mean(weights * (y_pred_log - y_log)**2) * 50.0
         
         # (B) P_CJ Anchor Penalty
         if target_P_cj is not None:
@@ -156,6 +185,21 @@ def fit_jwl_from_isentrope(
             
             E_integral = term1 + term2 + term3
             loss_energy = ((E_integral - constraint_total_energy) / constraint_total_energy) ** 2 * 5000.0
+        
+        # (H) V10.2 膨胀功分段验证
+        # 计算高压区 (V: 0.6-1.5) 和中压区 (V: 1.5-5.0) 的膨胀功
+        V_high = jnp.array([0.6, 0.8, 1.0, 1.2, 1.5])
+        V_mid = jnp.array([1.5, 2.0, 3.0, 4.0, 5.0])
+        
+        P_high = A * jnp.exp(-R1 * V_high) + B * jnp.exp(-R2 * V_high) + C / (V_high**(1.0 + w))
+        P_mid = A * jnp.exp(-R1 * V_mid) + B * jnp.exp(-R2 * V_mid) + C / (V_mid**(1.0 + w))
+        
+        # 膨胀功应随体积增加而增加 (积分值递增)
+        work_high = jnp.trapezoid(P_high, V_high)
+        work_mid = jnp.trapezoid(P_mid, V_mid)
+        
+        # 高压区贡献应大于中压区
+        work_penalty = jnp.where(work_high < work_mid * 0.5, 1e6, 0.0)
             
         # (E) Prior Penalty
         loss_prior = 0.0
@@ -167,7 +211,8 @@ def fit_jwl_from_isentrope(
             loss_prior += ((R2 - ep['R2'])/ep['R2'])**2 * 10.0
             loss_prior += ((w - ep['omega'])/ep['omega'])**2 * 10.0
             
-        return loss_fit + loss_anchor_P + loss_anchor_Gamma + loss_energy + loss_prior + penalty_barrier
+        return (loss_fit + loss_anchor_P + loss_anchor_Gamma + loss_energy + loss_prior + 
+                penalty_barrier + sound_speed_penalty + curvature_penalty + work_penalty)
 
     # 5. 优化准备 (使用先验作为初始值)
     if exp_priors:

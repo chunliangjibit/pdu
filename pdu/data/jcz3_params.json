@@ -13,11 +13,12 @@
       "alpha": 13.0
     },
     "H2O": {
-      "note": "JCZS3 Expert Calibration (Spherical Approx). V10: Supports Francis Ree Correction.",
+      "note": "V10.2: Ree-Ross Polar Correction with Dipole Moment",
       "epsilon_over_k": 333.0,
       "r_star": 3.27,
       "alpha": 13.0,
-      "lambda_ree": 1500.0
+      "lambda_ree": 1500.0,
+      "mu_debye": 1.85
     },
     "CO": {
       "epsilon_over_k": 108.0,
@@ -45,14 +46,19 @@
       "alpha": 13.0
     },
     "OH": {
+      "note": "Polar radical",
       "epsilon_over_k": 120.0,
       "r_star": 3.20,
-      "alpha": 13.0
+      "alpha": 13.0,
+      "mu_debye": 1.66
     },
     "NH3": {
+      "note": "V10.2: Ree-Ross Polar Correction with Dipole Moment",
       "epsilon_over_k": 481.0,
       "r_star": 3.31,
-      "alpha": 14.0
+      "alpha": 14.0,
+      "lambda_ree": 800.0,
+      "mu_debye": 1.47
     },
     "C_graphite": {
       "epsilon_over_k": 30.6,

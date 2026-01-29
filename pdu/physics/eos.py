@@ -146,25 +146,76 @@ def compute_effective_diameter_ratio(T, epsilon, alpha):
     return jnp.clip(ratio, 0.4, 1.2)
 
 @jax.jit
+def compute_polar_epsilon_ree_ross(
+    T: float,
+    eps0: float,
+    mu_debye: float = 0.0,      # 偶极矩 (Debye)
+    r_eq: float = 3.5,          # 平衡距离 (Angstrom)
+    lambda_ree: float = 0.0,    # 兼容旧参数
+    alpha_polar: float = 0.35   # MC 模拟校准常数
+) -> float:
+    """
+    Ree-Ross 极性修正 (V10.2)
+    
+    [物理基础]:
+    极性分子（如 H2O, NH3）的偶极-偶极相互作用在高温下被"热冲刷"部分抵消。
+    εeff = ε0 * (1 + α * μ^4 / (k_B * T * r_eq^6))
+    
+    同时保持与 V10.0 lambda_ree 参数的向后兼容:
+    εeff = ε0 * (1 + lambda_ree / T)
+    """
+    T_safe = jnp.maximum(T, 100.0)
+    
+    # 单位转换: 1 Debye = 3.336e-30 C·m
+    mu_SI = mu_debye * 3.336e-30
+    r_SI = r_eq * 1e-10  # Angstrom to m
+    
+    # Ree-Ross 偶极修正项
+    if mu_debye > 0.01:
+        dipole_term = alpha_polar * (mu_SI**4) / (K_BOLTZMANN * T_safe * r_SI**6)
+    else:
+        dipole_term = 0.0
+    
+    # 兼容旧 lambda_ree 简化修正
+    lambda_term = lambda_ree / T_safe
+    
+    # 组合修正 (取两者较大值)
+    correction = jnp.maximum(dipole_term, lambda_term)
+    
+    return eps0 * (1.0 + correction)
+
+
+@jax.jit
 def compute_mixed_matrices_dynamic(
     T: float,
     eps_vec: jnp.ndarray,
     r_vec: jnp.ndarray,
     alpha_vec: jnp.ndarray,
-    lambda_vec: jnp.ndarray
+    lambda_vec: jnp.ndarray,
+    mu_vec: jnp.ndarray = None  # V10.2: 偶极矩向量 (可选)
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    [V10 Core] Calculate mixing matrices dynamic with Temperature
-    Supports Francis Ree Correction: eps(T) = eps0 * (1 + lambda/T)
+    [V10.2 Core] Calculate mixing matrices with Ree-Ross Polar Correction
+    
+    Supports:
+    1. Francis Ree 简化修正: eps(T) = eps0 * (1 + lambda/T)
+    2. Ree-Ross 偶极修正: eps(T) = eps0 * (1 + α * μ^4 / (k_B * T * r^6))
     """
     T_safe = jnp.maximum(T, 1e-2)
     
-    # 1. Apply Ree Correction (Polar Water)
-    eps_T = eps_vec * (1.0 + lambda_vec / T_safe)
+    # 1. Apply Ree Correction (Polar Species)
+    # 如果提供了偶极矩向量，使用完整 Ree-Ross 修正
+    if mu_vec is not None:
+        # 逐物种计算修正后的 epsilon
+        def _apply_ree_ross(eps0, mu, r, lam):
+            return compute_polar_epsilon_ree_ross(T_safe, eps0, mu, r, lam)
+        eps_T = jax.vmap(_apply_ree_ross)(eps_vec, mu_vec, r_vec, lambda_vec)
+    else:
+        # 保持 V10.0 兼容: 使用简化 lambda/T 修正
+        eps_T = eps_vec * (1.0 + lambda_vec / T_safe)
     
     # 2. Lorentz-Berthelot Mixing
     # Epsilon: Geometric Mean: sqrt(e_i * e_j)
-    # Outer product equivalent: sqrt(e_i * e_j) = sqrt(outer(e, e))
     eps_matrix = jnp.sqrt(jnp.outer(eps_T, eps_T))
     
     # R_star: Arithmetic Mean: (r_i + r_j) / 2
@@ -174,6 +225,7 @@ def compute_mixed_matrices_dynamic(
     alpha_matrix = 0.5 * (jnp.expand_dims(alpha_vec, 1) + jnp.expand_dims(alpha_vec, 0))
     
     return eps_matrix, r_matrix, alpha_matrix
+
 
 @jax.jit
 def compute_excess_repulsion(
