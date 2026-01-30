@@ -7,7 +7,7 @@ from typing import Tuple, NamedTuple, Optional
 from functools import partial
 
 from pdu.core.equilibrium import solve_equilibrium
-from pdu.physics.eos import compute_pressure_jcz3, compute_internal_energy_jcz3, compute_entropy_consistent
+from pdu.physics.eos import compute_pressure_jcz3, compute_internal_energy_jcz3, compute_entropy_consistent, compute_total_helmholtz_energy, smooth_floor
 from pdu.utils.precision import to_fp64, to_fp32
 
 """
@@ -67,43 +67,80 @@ def get_thermo_properties_jvp(primals, tangents):
     return (P, n), (to_fp32(dP_total), jnp.zeros_like(n))
 
 @jit
+@jit
 def get_sound_speed(rho, T, n, atom_vec, coeffs_low, coeffs_high, eos_params, atomic_masses):
     """
-    计算冻结声速 (Frozen Sound Speed)
+    计算冻结声速 (Consistent A-only Derivation)
+    Patch C: 只从 Helmholtz A(V,T) 推导声速，确保热力学一致性
     """
+    # 冻结组成，避免 AD 污染
+    n = jax.lax.stop_gradient(n)
+    
     rho_64 = to_fp64(rho)
     T_64 = to_fp64(T)
     n_64 = to_fp64(n)
     mw_g_per_mol = jnp.dot(atom_vec, atomic_masses)
     
-    def p_func(r, t):
-        v = mw_g_per_mol / (r + 1e-10)
-        return compute_pressure_jcz3(n_64, v, t, coeffs_low, coeffs_high, *eos_params, mw_g_per_mol)
+    # 质量与密度 (SI)
+    # rho 输入单位是 g/cm3 -> 内部转为 kg/m3 计算导数
+    # V_total 在 eos.py 里被视为 cm3/mol (recipe)
+    # m_kg = mw_g / 1000
+    m_kg = mw_g_per_mol * 1e-3
     
-    def u_func(r, t):
-        v = mw_g_per_mol / (r + 1e-10)
-        return compute_internal_energy_jcz3(n_64, v, t, coeffs_low, coeffs_high, *eos_params, mw_g_per_mol)
+    # 定义 A(V_cm3, T)
+    def A_of_VT(Vc, Tc):
+        return compute_total_helmholtz_energy(
+            n_64, Vc, Tc, 
+            coeffs_low, coeffs_high, 
+            *eos_params, 
+            mw_g_per_mol
+        )
+    
+    # 当前体积 (cm3/mol)
+    V_cm3 = mw_g_per_mol / (rho_64 + 1e-10)
+    V_m3 = V_cm3 * 1e-6
+    rho_si = m_kg / V_m3 # kg/m3
 
-    # 1. 计算偏导数
-    dP_drho, dP_dT = jax.grad(p_func, argnums=(0, 1))(rho_64, T_64)
-    dU_dT = jax.grad(u_func, argnums=1)(rho_64, T_64)
+    # 一阶导
+    dA_dV = jax.grad(A_of_VT, argnums=0)
+    dA_dT = jax.grad(A_of_VT, argnums=1)
     
-    # 2. 定容比热 Cv (J/kg*K)
-    mw_kg = mw_g_per_mol / 1000.0
-    cv = dU_dT / mw_kg
+    # 二阶导
+    d2A_dV2 = jax.grad(lambda v, t: dA_dV(v, t), argnums=0)
+    d2A_dVdT = jax.grad(lambda v, t: dA_dV(v, t), argnums=1)
+    d2A_dT2 = jax.grad(lambda v, t: dA_dT(v, t), argnums=1)
     
-    # 3. 绝热声速
-    # a^2 = dP/drho + (T/rho^2/Cv) * (dP/dT)^2 ? 
-    # 单位转换注意：rho 是 g/cm3 -> 1000 kg/m3
-    rho_si = rho_64 * 1000.0
-    term_entropy = (T_64 / (rho_si**2 * cv + 1e-10)) * (dP_dT**2)
+    # 计算导数值
+    A_V = dA_dV(V_cm3, T_64)      # J/cm3
+    A_VV = d2A_dV2(V_cm3, T_64)   # J/cm6
+    A_VT = d2A_dVdT(V_cm3, T_64)  # J/(cm3 K)
+    A_TT = d2A_dT2(V_cm3, T_64)   # J/K2
     
-    # dP_drho 这里的 rho 是 g/cm3, 需要转为 kg/m3
-    # P(Pa), rho(kg/m3) => a^2 (m2/s2)
-    # dP/drho_si = dP/drho_gcm3 / 1000
-    a2 = (dP_drho / 1000.0) + term_entropy
+    # 转 SI 压强与导数
+    # P = -dA/dV
+    P = -A_V * 1e6                 # Pa
+    P_T = -A_VT * 1e6              # Pa/K
+    P_V_T = -A_VV * 1e12           # Pa/m3 (注意 cm6 -> m6 是 1e-12, 在分母所以是 1e12)
     
-    return to_fp32(jnp.sqrt(jnp.maximum(a2, 1e-6)))
+    # Cv_total = -T * d2A/dT2 (J/K)
+    Cv_total = -T_64 * A_TT
+    
+    # 数值保护: Cv 必须正且不能太小
+    Cv_min = 1e-6
+    Cv_total = smooth_floor(Cv_total, Cv_min, 1e-6)
+    cv_mass = Cv_total / m_kg      # J/kg/K
+    
+    # 热力学公式: (dP/drho)_s = (dP/drho)_T + T/(rho^2 * cv) * (dP/dT)^2
+    # (dP/drho)_T = (dP/dV)_T * (dV/drho)
+    # V = m/rho -> dV/drho = -m/rho^2 = -V/rho
+    dP_drho_T = P_V_T * (-V_m3 / rho_si) # Pa / (kg/m3) = m2/s2
+    
+    # 绝热声速平方
+    a2 = dP_drho_T + (T_64 / (rho_si**2 * cv_mass)) * (P_T**2)
+    
+    # 最终保护
+    a2 = jnp.maximum(a2, 1.0)
+    return to_fp32(jnp.sqrt(a2))
 
 @jit
 def get_internal_energy_pt(rho, T, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params):

@@ -95,19 +95,20 @@ def calibrate_hmx():
     sol = solve_znd_profile(D_var, init_state, (0.0, 2e-4), eos_data, drag_m, heat_m, q_reaction)
     
     # 检查末态
-    rho_f = sol.ys.gas.rho[-1]
-    T_f = sol.ys.gas.T[-1]
-    u_f = sol.ys.gas.u[-1]
+    # 检查末态
+    rho_f = sol.gas.rho[-1]
+    T_f = sol.gas.T[-1]
+    u_f = sol.gas.u[-1]
     
     P_f, _ = get_thermo_properties(rho_f, T_f, *eos_data)
     
-    print(f"Final State (lam={sol.ys.gas.lam[-1]:.3f}, Steps={len(sol.ts)}):")
+    print(f"Final State (lam={sol.gas.lam[-1]:.3f}, Steps={len(sol.x)}):")
     print(f"  P = {P_f/1e9:.2f} GPa (Exp: {P_exp:.2f})")
     print(f"  u = {u_f:.1f} m/s")
     
     # 打印剖面简报
     print("\nProfile Overview (lam):")
-    print(sol.ys.gas.lam[:10])
+    print(sol.gas.lam[:10])
     
     # 计算误差
     p_err = (P_f/1e9 - P_exp) / P_exp

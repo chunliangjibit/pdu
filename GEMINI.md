@@ -50,8 +50,9 @@ PYTHONPATH=. python pdu/tests/test_v10_5_benchmark.py
 [0.25, 0.45]$ and $B/A < 0.1$ are mandatory to avoid numerical toxins.
 *   **Energy Consistency:** JWL $E_0$ must match the effective mechanical work (Gurney Energy), typically $0.72 \times Q_{theoretical}$ for Al-explosives.
 
-## Current Development Focus (V10.6)
+## Current Development Focus (V11.0 Phase 5)
 
-*   **Status:** V10.6 Implemented & Validated.
-*   **Achievement:** Successfully pushed JWL parameters back into the physical "topology valley". Corrected Tritonal VOD deficit using energy-sink and matrix-quenching models.
-*   **Next Phase:** V11 "Multi-Phase Discrete Dynamics" to solve P-D decoupling in non-ideal explosives.
+*   **Status:** V11.0 Phase 5 (Thermodynamic Hardening) Implemented.
+*   **Achievement:** Successfully stabilized ZND solver using **Patch A-D** (Smooth Barriers, Sigmoid NASA, Consistent Sound Speed, Reject & Shrink Integrator). Eliminated all NaN/Sonic instabilities.
+*   **Current Blocker:** **Reaction Stagnation**. ZND ignition fails due to anomalously low pressure (0.12 GPa vs expected >30 GPa) at VN point. Investigation into unit/state initialization is ongoing.
+*   **Next Phase:** Resolve stagnation issue and proceed to Multi-Explosive Benchmark.

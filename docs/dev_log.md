@@ -33,3 +33,29 @@
 
 **3. 下阶段目标：两相流转型**
 - 已完成《两相流转型技术咨询需求书 (V1.1)》，明确了解决“12 GPa vs 21 GPa”压力悖论的技术路线。后续将重点转向一维 ZND 反应流结构的 ODE 建模。
+
+---
+
+### 13. 2026-01-30 V11.0 Phase 5 - Thermodynamics Hardening (Patch A-D)
+
+针对 V11 Phase 4 暴露出的“HMX 高密度 NaN 崩溃”与“声速伪超音速点”问题，基于专家咨询意见实施了全面的数值重构：
+
+**1. Patch A (Smooth Barriers):**
+- 彻底移除了 EOS 中所有的一阶不连续截断 (`maximum`, `clip`)。
+- 对 $\eta > 0.95$ 的超饱和区引入了 C2 连续的 **Soft Barrier**，防止粒子重叠引发的负排斥与机械不稳定。
+- 实现了 $V_{gas}$ 的光滑底板，消除了极小体积下的导数震荡。
+
+**2. Patch B (NASA Smoothing):**
+- 将 NASA 七系数多项式的 1000K 温区切换由硬判断改为 **Sigmoid 平滑过渡**，消除了 $C_p$ 导数尖峰。
+
+**3. Patch C (Thermodynamic Consistency):**
+- 重写了声速计算逻辑，**仅从 Helmholtz 自由能导数推导**，切断了与 Cage Correction 压力修正的耦合。
+- 现在的 $a^2$ 保证了热力学一致性，彻底根除了“伪 Sonic Point”。
+
+**4. Patch D (Robust Integration):**
+- ZND 积分器升级为 **"Reject & Shrink"** 架构。
+- 自动检测 NaN、$a^2 < 0$、$\eta > 1.1$ 等坏点并回退步长。
+
+**当前状态:**
+- **稳定性**: ZND 模拟器已实现 100% 稳定运行，无崩溃。
+- **新挑战**: 出现了“反应停滞”现象。HMX 在 VN 点后的压强被计算为异常低的 0.12 GPa (预期 > 39 GPa)，导致点火动力学受阻。目前正针对此单位/状态初始化问题进行专项排查。

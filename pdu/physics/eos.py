@@ -14,6 +14,21 @@ K_BOLTZMANN = 1.380649e-23
 # 阿伏伽德罗常数
 N_AVOGADRO = 6.02214076e23
 
+@jax.jit
+def smooth_floor(x, xmin, w):
+    # C1 光滑下界：>= xmin
+    return xmin + jax.nn.softplus((x - xmin) / w) * w
+
+@jax.jit
+def smooth_cap(x, xmax, w):
+    # C1 光滑上界：<= xmax
+    return xmax - jax.nn.softplus((xmax - x) / w) * w
+
+@jax.jit
+def smooth_switch(T, T0=1000.0, width=30.0):
+    # Sigmoid 平滑切换 (0 -> 1)
+    return jax.nn.sigmoid((T - T0) / width)
+
 @dataclass
 class JCZ3EOS:
     """JCZ3 状态方程类 (Refactored for V10 Dynamic Mixing)"""
@@ -78,8 +93,15 @@ class JCZ3EOS:
 
 # Hoisted vmap for better compilation stability
 def _get_thermo_single(coeffs_low, coeffs_high, T):
-    u_val = jnp.where(T > 1000.0, compute_u_ideal(coeffs_high, T), compute_u_ideal(coeffs_low, T))
-    s_val = jnp.where(T > 1000.0, compute_entropy(coeffs_high, T), compute_entropy(coeffs_low, T))
+    u_low = compute_u_ideal(coeffs_low, T)
+    s_low = compute_entropy(coeffs_low, T)
+    u_high = compute_u_ideal(coeffs_high, T)
+    s_high = compute_entropy(coeffs_high, T)
+    
+    # Patch B: Sigmoid 平滑过渡，消除 T=1000K 处的导数尖峰
+    w = smooth_switch(T, 1000.0, 30.0)
+    u_val = (1.0 - w) * u_low + w * u_high
+    s_val = (1.0 - w) * s_low + w * s_high
     return u_val, s_val
 
 _get_thermo_vec = jax.vmap(_get_thermo_single, in_axes=(0, 0, None))
@@ -92,7 +114,11 @@ def compute_effective_diameter_ratio(T, epsilon, alpha):
     term = (alpha_minus_6 / 6.0) * T_star
     log_term = jnp.log(jnp.maximum(term, 1e-10))
     ratio = 1.0 - (1.0 / alpha) * log_term
-    return jnp.clip(ratio, 0.4, 1.2)
+    
+    # Patch A: Smooth Clip for diameter ratio
+    ratio = smooth_floor(ratio, 0.4, 0.02)
+    ratio = smooth_cap(ratio, 1.2, 0.02)
+    return ratio
 
 @jax.jit
 def compute_polar_epsilon_ree_ross(T, eps0, lambda_ree):
@@ -172,7 +198,10 @@ def compute_total_helmholtz_energy(
     inert_compress = jnp.power(1.0 + 4.0 * P_proxy / 76e9, -1.0/4.0)
     V_condensed_fixed = n_fixed_solids * v0_fixed_solids * inert_compress
     V_condensed_total = V_condensed_eq + V_condensed_fixed
-    V_gas_eff = jnp.maximum(V_total - V_condensed_total, 1e-3)
+    
+    # Patch A: V_gas_eff 光滑地板 (V_MIN=1e-6 cm3)
+    V_gas_raw = V_total - V_condensed_total
+    V_gas_eff = smooth_floor(V_gas_raw, 1e-6, 1e-6)
     V_gas_m3 = V_gas_eff * 1e-6
 
     # 气相非理想
@@ -183,16 +212,31 @@ def compute_total_helmholtz_energy(
     A_gas_ideal = jnp.sum(n_gas * (u_vec - T * s0_vec)) + R * T * jnp.sum(jnp.where(n_gas > 1e-18, n_gas * jnp.log((n_gas_safe * R * T) / (V_gas_m3 * 1e5)), 0.0))
     
     B_total_gas = compute_covolume(n_gas, r_mat, T, eps_mat, alpha_mat, r_star_rho_corr)
-    eta = B_total_gas / (4.0 * V_gas_eff)
-    jax.debug.print("T={t}, V_gas={v}, eta_raw={e}", t=T, v=V_gas_eff, e=eta)
-    # V11 Phase 4: 直接使用 eta 以保持压强刚性，依靠分母 maximum(1-eta, 0.05) 保证数值安全
-    A_excess_hs = n_gas_total * R * T * (4.0*eta - 3.0*eta**2) / (jnp.maximum(1.0 - eta, 0.05)**2)
+    eta_raw = B_total_gas / (4.0 * V_gas_eff)
+    
+    # Patch A: Safe CS + Soft Barrier for eta > 0.95
+    ETA_CAP = 0.95
+    ETA_CAP_W = 0.005
+    
+    # CS 部分只在 safe 域内有效 (<0.95)
+    eta_cs = smooth_cap(eta_raw, ETA_CAP, ETA_CAP_W)
+    one_minus = smooth_floor(1.0 - eta_cs, 1e-6, 1e-6)
+    f_cs = (4.0 * eta_cs - 3.0 * eta_cs * eta_cs) / (one_minus * one_minus)
+    A_cs = n_gas_total * R * T * f_cs
+    
+    # Barrier 部分: 对 overshoot 进行惩罚
+    OVER_W = 0.02
+    over = jax.nn.softplus((eta_raw - ETA_CAP) / OVER_W) * OVER_W
+    K_ETA = 100.0
+    A_bar = n_gas_total * R * T * K_ETA * (over / OVER_W) ** 2
+    
+    A_excess_hs = A_cs + A_bar
+    jax.debug.print("T={t}, V_gas={v}, eta_raw={e}, A_hs={a}", t=T, v=V_gas_eff, e=eta_raw, a=A_excess_hs)
     
     U_attr = - ((2.0 * jnp.pi / 3.0) * (N_AVOGADRO**2) * K_BOLTZMANN * 1e-24 * jnp.sum(jnp.outer(n_gas, n_gas) * eps_mat * r_mat**3)) / V_gas_eff
     
-    # V11.0 Phase 4 Hardening: Baseline (Disabled)
-    A_rep = n_gas_total * R * T * 0.0 * (eta**4) / jnp.maximum(1.0 - eta, 0.05)
-    A_gas_total = A_gas_ideal + A_excess_hs + U_attr + A_rep
+    A_rep = 0.0 # Deprecated, merged into A_bar
+    A_gas_total = A_gas_ideal + A_excess_hs + U_attr
 
     A_solid_eq = jnp.sum(n_solid * (u_vec - T * s0_vec))
     cv_al_eff = 45.0

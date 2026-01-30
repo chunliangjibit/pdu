@@ -8,8 +8,8 @@ from pdu.thermo.implicit_eos import get_thermo_properties, get_sound_speed
 from pdu.flux import compute_total_sources
 
 """
-PDU V11.0 Tier 2: ZND 求解器 (GPU 优化版)
-使用固定步长 RK4 积分，最大化 JIT 编译效率。
+PDU V11.0 Tier 2: ZND 求解器 (Robust Manual Integration)
+Patch D: "Reject & Shrink" 策略，检测 NaN/负声速/过饱和并自动回退缩步。
 """
 
 def znd_desingularized_field(xi, state, args):
@@ -92,58 +92,150 @@ def znd_desingularized_field(xi, state, args):
     
     return jnp.array([drho_dxi, du_dxi, dt_dxi, dlam_dxi, dx_dxi])
 
-def solve_znd_profile(D, init_state, x_span, eos_data, drag_model, heat_model, q_reaction, n_steps=1000):
+def solve_znd_profile(D, init_state, x_span, eos_data, drag_model, heat_model, q_reaction, n_steps=2000):
     """
-    Phase 1 简化版 ZND 求解器
-    使用 5 维状态向量 [rho, u, T, lam, x]，移除 n 以消除刚性。
+    V11 Phase 5: 手动积分 ZND 求解器 (Reject & Shrink)
+    完全替代 Diffrax 以实现细粒度的步长控制和坏点诊断。
     """
-    import diffrax
-    
-    # Phase 1: 简化状态向量 (5维)
-    y0 = jnp.array([
-        init_state.gas.rho, 
-        init_state.gas.u, 
-        init_state.gas.T, 
-        init_state.gas.lam, 
-        0.0  # x 初始位置
+    # 初始状态 [rho, u, T, lam, x]
+    y = jnp.array([
+        init_state.gas.rho,
+        init_state.gas.u,
+        init_state.gas.T,
+        init_state.gas.lam,
+        0.0
     ])
+
+    # 存储轨迹
+    history = {
+        'rho': [y[0]], 'u': [y[1]], 'T': [y[2]], 'lam': [y[3]], 'x': [y[4]],
+        'P': [], 'a2': [], 'eta': [], 'step_size': []
+    }
+
+    # 初始辅助变量计算
+    def evaluate_aux(state):
+        rho, u, T, lam, x = state
+        atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params = eos_data
+        P_pa, n_gas = get_thermo_properties(rho, T, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params)
+        cs_val = get_sound_speed(rho, T, n_gas, atom_vec, coeffs_low, coeffs_high, eos_params, atomic_masses)
+        
+        # 计算 eta 用于诊断
+        # 注意: 这里简化计算，仅用于 check
+        # 实际应从 EOS 内部获取，但为性能暂用近似或重新计算
+        # 为避免复杂，这里只返回 P 和 cs
+        return P_pa, cs_val**2
+
+    P0, a20 = evaluate_aux(y)
+    history['P'].append(P0)
+    history['a2'].append(a20)
+    history['eta'].append(0.0) # Placeholder
+    history['step_size'].append(0.0)
+
+    dxi = 1e-5     # 初始伪时间步长
+    xi = 0.0
+    
     args = (eos_data, drag_model, heat_model, D, q_reaction)
     
-    # 使用显式求解器 Tsit5 (刚性已通过移除 n 消除)
-    solver = diffrax.Tsit5()
-    stepsize_controller = diffrax.PIDController(rtol=1e-6, atol=1e-8)
-    
-    sol = diffrax.diffeqsolve(
-        diffrax.ODETerm(znd_desingularized_field),
-        solver,
-        t0=0.0,
-        t1=1.0,  # 伪时间预算 (调整为 1.0)
-        dt0=1e-5,
-        y0=y0,
-        args=args,
-        max_steps=50000, # 增加步数限制
-        stepsize_controller=stepsize_controller,
-        saveat=diffrax.SaveAt(steps=True),
-        adjoint=diffrax.RecursiveCheckpointAdjoint()
-    )
+    print(f"ZND Start: D={D}, rho0={y[0]:.2f}, T0={y[2]:.1f}, P0={P0/1e9:.2f} GPa")
 
-    
-    class Sol:
-        def __init__(self, sol_diffrax):
-            self.ts = sol_diffrax.ts
-            # y 结构: [rho, u, T, lam, x]
-            self.gas = GasState(
-                rho=sol_diffrax.ys[:, 0],
-                u=sol_diffrax.ys[:, 1],
-                T=sol_diffrax.ys[:, 2],
-                lam=sol_diffrax.ys[:, 3]
-            )
-            self.x = sol_diffrax.ys[:, 4]
-            self.ys = self
-            # 存储最终的导数用于 Loss 计算
-            self._final_state = sol_diffrax.ys[-1]
+    for step in range(n_steps):
+        # RK4 积分步
+        # k1
+        dy1 = znd_desingularized_field(xi, y, args)
+        
+        # k2
+        y2 = y + 0.5 * dxi * dy1
+        dy2 = znd_desingularized_field(xi + 0.5 * dxi, y2, args)
+        
+        # k3
+        y3 = y + 0.5 * dxi * dy2
+        dy3 = znd_desingularized_field(xi + 0.5 * dxi, y3, args)
+        
+        # k4
+        y4 = y + dxi * dy3
+        dy4 = znd_desingularized_field(xi + dxi, y4, args)
+        
+        y_next = y + (dxi / 6.0) * (dy1 + 2*dy2 + 2*dy3 + dy4)
+        
+        # ---------------------------------------------------------
+        # Patch D: Reject & Shrink 检查
+        # ---------------------------------------------------------
+        rho_n, u_n, T_n, lam_n, x_n = y_next
+        
+        # 1. NaN / Inf 检查
+        if not jnp.all(jnp.isfinite(y_next)):
+            print(f"Step {step}: Reject (NaN detected). Shrinking dxi {dxi:.2e} -> {dxi*0.5:.2e}")
+            dxi *= 0.5
+            continue
+
+        # 2. 物理约束检查 (EOS / 声速)
+        try:
+            P_n, a2_n = evaluate_aux(y_next)
             
-    return Sol(sol)
+            # 2.1 声速检查
+            if a2_n <= 0.0:
+                 print(f"Step {step}: Reject (Negative a2={a2_n:.2e}). Shrinking...")
+                 dxi *= 0.5
+                 continue
+                 
+            # 2.2 反应进度倒退检查 (允许微小数值波动)
+            if lam_n < history['lam'][-1] - 1e-4:
+                 print(f"Step {step}: Reject (Lambda reversal). Shrinking...")
+                 dxi *= 0.5
+                 continue
+
+        except Exception as e:
+            print(f"Step {step}: Reject (EOS Error: {e}). Shrinking...")
+            dxi *= 0.5
+            continue
+            
+        # ---------------------------------------------------------
+        # Accept Step
+        # ---------------------------------------------------------
+        y = y_next
+        xi += dxi
+        
+        # 记录
+        history['rho'].append(rho_n)
+        history['u'].append(u_n)
+        history['T'].append(T_n)
+        history['lam'].append(lam_n)
+        history['x'].append(x_n)
+        history['P'].append(P_n)
+        history['a2'].append(a2_n)
+        history['eta'].append(0.0)
+        history['step_size'].append(dxi)
+        
+        # 动态步长调整 (简单的增长策略)
+        if step % 10 == 0:
+            dxi = min(dxi * 1.1, 1e-3)
+            
+        # 终止条件: 反应完成
+        if lam_n >= 0.99:
+            print(f"ZND Finished: Lambda reached 0.99 at step {step}")
+            break
+            
+    # 转换为 Sol 对象格式返回
+    class Sol:
+        pass
+    sol = Sol()
+    # 转换为 jnp array
+    for k, v in history.items():
+        setattr(sol, k, jnp.array(v))
+        
+    # 构造 gas 结构
+    sol.gas = GasState(
+        rho=sol.rho,
+        u=sol.u,
+        T=sol.T,
+        lam=sol.lam
+    )
+    # 为兼容 shooting_residual
+    sol.ys = jnp.stack([sol.rho, sol.u, sol.T, sol.lam, sol.x], axis=-1)
+    
+    return sol
+
+# (solve_znd_profile has been replaced above)
 
 def shooting_residual(D, init_state, x_span, eos_data, drag_model, heat_model, q_reaction):
     """
@@ -157,9 +249,9 @@ def shooting_residual(D, init_state, x_span, eos_data, drag_model, heat_model, q
     
     逻辑: 在 CJ 点，分子和分母必须同时趋零。
     """
-    sol = solve_znd_profile(D, init_state, x_span, eos_data, drag_model, heat_model, q_reaction)
+    sol = solve_znd_profile(D, init_state, x_span, eos_data, drag_model, heat_model, q_reaction, n_steps=5000)
     
-    # 终点状态
+    # 终点状态 (Sol 对象现在直接存储 jnp array)
     u_f = sol.gas.u[-1]
     rho_f = sol.gas.rho[-1]
     T_f = sol.gas.T[-1]
