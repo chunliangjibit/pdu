@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-**PyDetonation-Ultra (PDU)** is a high-fidelity, differentiable physics engine designed for simulating detonation performance and calibrating Equation of State (EOS) parameters for explosives. Built on **JAX**, it leverages automatic differentiation to enable gradient-based optimization for inverse design (recipe formulation) and parameter fitting.
+**PyDetonation-Ultra (PDU)** is a high-fidelity, differentiable physics engine designed for simulating detonation performance and calibrating Equation of State (EOS) parameters for explosives. Built on **JAX**, it leverages automatic differentiation to enable gradient-based optimization for parameter fitting and physics calibration.
 
-The project is currently in the **V10.6 "Constrained Physics"** phase, focusing on physical consistency and engineering compatibility of JWL parameters.
+The project is currently in the **V10.6 "Constrained Physics"** phase, focusing on physical consistency and engineering compatibility of JWL parameters, and is transitioning towards **V11 Multi-Phase Dynamics**.
 
 ### Core Technologies
 *   **Language:** Python 3.9+
@@ -18,22 +18,21 @@ The project is currently in the **V10.6 "Constrained Physics"** phase, focusing 
 The project adheres to strict environmental isolation using Conda.
 *   **Environment Name:** `nnrf`
 *   **Activation:** `mamba activate nnrf`
+*   **Note**: Local `.venv` has been removed to ensure environment consistency.
 
 ### Directory Structure
 ```
 /home/jcl/HDY/PyDetonation-Ultra/
-├── pdu/                    # Core source code
+├── pdu/                    # Core source code (Forward-Only Focus)
 │   ├── api.py              # Global Quenching & Heat Sink Logic
 │   ├── core/               # Equilibrium solvers (Schur-RAND)
-│   ├── physics/            # Physics modules
-│   │   ├── kinetics.py     # Thermal Lag & Miller models
-│   │   ├── jwl.py          # Constrained Physics Fitting (Barrier-based)
-│   │   └── eos.py          # JCZ3 + High-P Energy Correction
+│   ├── physics/            # Physics modules (EOS, Kinetics, JWL)
+│   ├── calibration/        # PSO-based Parameter Fitting
 │   └── tests/              # Benchmark suites
 ├── docs/                   # Documentation & Whitepapers
 │   ├── project_whitepaper.md # Latest V10.6 validation results
-│   ├── 反馈意见.md           # Critical audit feedback driving V10.6
-│   └── *_benchmark.py      # Benchmark scripts
+│   ├── 反馈意见.md           # Critical audit feedback
+│   └── 两相流转型咨询需求书.md # V11 Roadmap
 └── RULES.md                # Authoritative guide
 ```
 
