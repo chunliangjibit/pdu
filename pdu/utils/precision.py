@@ -10,28 +10,11 @@ from functools import wraps
 from typing import Callable, Any
 
 
-def to_fp32(x: jnp.ndarray) -> jnp.ndarray:
-    """将数组转换为 float32
-    
-    Args:
-        x: 输入数组
-        
-    Returns:
-        float32 数组
-    """
-    return x.astype(jnp.float32)
+def to_fp64(x):
+    return jnp.asarray(x).astype(jnp.float64)
 
-
-def to_fp64(x: jnp.ndarray) -> jnp.ndarray:
-    """将数组转换为 float64
-    
-    Args:
-        x: 输入数组
-        
-    Returns:
-        float64 数组
-    """
-    return x.astype(jnp.float64)
+def to_fp32(x):
+    return jnp.asarray(x).astype(jnp.float32)
 
 
 def mixed_precision_wrapper(compute_in_fp32: bool = True):

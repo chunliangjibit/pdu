@@ -96,7 +96,9 @@ def predict_cj_with_isentrope(
         return carry, (D, P_pa, T_hug, V_test, n_eq)
     
     v_ratios = jnp.linspace(0.5, 0.85, 20)
-    _, hug_data = jax.lax.scan(scan_hugoniot, None, v_ratios)
+    # 显存优化: 对 Hugoniot 扫描进行 Checkpointing
+    checkpointed_scan = jax.checkpoint(lambda r: jax.lax.scan(scan_hugoniot, None, r))
+    _, hug_data = checkpointed_scan(v_ratios)
     
     D_grid, P_grid, T_grid, V_grid, n_grid = hug_data
     
@@ -147,7 +149,9 @@ def predict_cj_with_isentrope(
     # Scan expansion from V_cj to 8.0*V0 (Standard JWL range)
     # We use a fixed size for JIT, but here n_isentrope_points is passed from top
     iso_v_ratios = jnp.linspace(V_cj/V0, 8.0, n_isentrope_points)
-    _, iso_data = jax.lax.scan(scan_isentrope, None, iso_v_ratios)
+    # 显存优化: 对等熵线扫描进行 Checkpointing
+    checkpointed_iso_scan = jax.checkpoint(lambda r: jax.lax.scan(scan_isentrope, None, r))
+    _, iso_data = checkpointed_iso_scan(iso_v_ratios)
     
     return D_cj, P_cj, T_cj, V_cj, iso_data[0], iso_data[1], n_cj
 

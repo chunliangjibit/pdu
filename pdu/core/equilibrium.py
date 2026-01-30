@@ -122,19 +122,30 @@ def _solve_equilibrium_impl(
     T: float,
     A: jnp.ndarray,
     coeffs_all: jnp.ndarray,
-    eos_params: tuple
+    eos_params: tuple,
+    n_init: Optional[jnp.ndarray] = None
 ) -> jnp.ndarray:
-    """求解化学平衡 (Primal Implementation) (V8支持多相)"""
+    """
+    求解化学平衡 (Primal Implementation)
+    支持 Warm-Start (n_init) 以加速 ODE 空间步积分。
+    """
     n_species = A.shape[1]
-    n_init = jnp.ones(n_species) * (1.0 / n_species)
+    if n_init is None:
+        # 质量一致性初始猜想: A @ n = atom_vec
+        # 简单分配到各物种
+        n_start = jnp.ones(n_species) * (jnp.sum(atom_vec) / (jnp.sum(A) + 1e-10))
+    else:
+        n_start = n_init
+        
     active_mask = jnp.ones(n_species)
     
     # Pass eos_params into state
-    init_state = (n_init, A, atom_vec, coeffs_all, V, T, active_mask, 1.0, 0, eos_params)
+    init_state = (n_start, A, atom_vec, coeffs_all, V, T, active_mask, 1.0, 0, eos_params)
     
     def cond_fn(val):
         state, res_norm = val
         iter_idx = state[-2] 
+        # Warm-Start 下通常只需极少迭代
         return (res_norm > 1e-4) & (iter_idx < 300)
     
     def body_fn(val):
@@ -147,8 +158,8 @@ def _solve_equilibrium_impl(
     return n_final
 
 
-def solve_equilibrium_fwd(atom_vec, V, T, A, coeffs_all, eos_params):
-    n_star = _solve_equilibrium_impl(atom_vec, V, T, A, coeffs_all, eos_params)
+def solve_equilibrium_fwd(atom_vec, V, T, A, coeffs_all, eos_params, n_init=None):
+    n_star = _solve_equilibrium_impl(atom_vec, V, T, A, coeffs_all, eos_params, n_init)
     return n_star, (n_star, atom_vec, V, T, A, coeffs_all, eos_params)
 
 def solve_equilibrium_bwd(res, g_n):
