@@ -4,7 +4,8 @@ import jax.numpy as jnp
 from typing import Tuple, Any
 
 from pdu.core.types import GasState, ParticleState, State
-from pdu.thermo.implicit_eos import get_thermo_properties, get_sound_speed
+from pdu.thermo.implicit_eos import get_thermo_properties, get_sound_speed, _mixture_mass_and_mw_avg_kg_per_mol, _rho_to_kg_per_m3
+from pdu.physics.eos import compute_total_helmholtz_energy, smooth_floor
 from pdu.flux import compute_total_sources
 
 """
@@ -247,6 +248,418 @@ def solve_znd_profile(D, init_state, x_span, eos_data, drag_model, heat_model, q
     return sol
 
 # (solve_znd_profile has been replaced above)
+
+# =============================================================================
+# Patch E (Expert V1): Thermodynamic Projection Solver
+# =============================================================================
+
+class NewtonConfig:
+    max_it: int = 20
+    tol: float = 1e-3 # Pa (Absolute tolerance). 1e-3 Pa is extremely tight for 50 GPa.
+    V_min: float = 1e-8  # m3/kg (approx)
+    T_min: float = 100.0 # K
+    max_ls: int = 5
+
+def thermo_from_helmholtz(n, V_total, T, coeffs_low, coeffs_high,
+                          eps_vec, r_star_vec, alpha_vec, lambda_vec,
+                          solid_mask, solid_v0,
+                          n_fixed_solids=0.0, v0_fixed_solids=10.0, e_fixed_solids=0.0,
+                          r_star_rho_corr=0.0,
+                          mw_avg=1.0): # mw_avg is placeholder if we calculate mass internally? 
+    # Expert code suggestion: "mw_avg=mw_avg".
+    # We must ensure consistent mass usage.
+    
+    # Calculate A and derivatives
+    # Note: compute_total_helmholtz_energy returns A value. 
+    # We need derivatives.
+    
+    # We need to wrap it to get derivatives w.r.t V_total and T
+    def A_of_VT(Vc, Tc):
+        return compute_total_helmholtz_energy(
+            n, Vc, Tc, 
+            coeffs_low, coeffs_high,
+            eps_vec, r_star_vec, alpha_vec, lambda_vec,
+            solid_mask, solid_v0,
+            n_fixed_solids, v0_fixed_solids, e_fixed_solids,
+            r_star_rho_corr,
+            mw_avg=mw_avg
+        )
+
+    # Derivatives
+    # compute_total_helmholtz_energy is jitted, so we can grad it.
+    # But it's better to use the same logic as implicit_eos.py/get_sound_speed to capture gradients cleanly.
+    
+    # Use jax.value_and_grad?
+    # Or just grad.
+    
+    A_val = A_of_VT(V_total, T)
+    
+    dA_dV = jax.grad(A_of_VT, argnums=0)
+    dA_dT = jax.grad(A_of_VT, argnums=1)
+    
+    d2A_dV2 = jax.grad(lambda v, t: dA_dV(v, t), argnums=0)
+    d2A_dVdT = jax.grad(lambda v, t: dA_dV(v, t), argnums=1)
+    d2A_dT2 = jax.grad(lambda v, t: dA_dT(v, t), argnums=1)
+    
+    # Compute values
+    A_V = dA_dV(V_total, T)
+    A_T = dA_dT(V_total, T)
+    A_VV = d2A_dV2(V_total, T)
+    A_VT = d2A_dVdT(V_total, T)
+    A_TT = d2A_dT2(V_total, T)
+
+    P = -A_V
+    P_T = -A_VT
+    P_V = -A_VV
+    
+    U_total = A_val - T * A_T
+    Cv_total = -T * A_TT
+    
+    return P, U_total, Cv_total, P_T, P_V
+
+def project_state_to_conservation(n, V_guess, T_guess,
+                                  J, Pi, E,
+                                  eos_data, newton_cfg=NewtonConfig()):
+    
+    atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params = eos_data
+    
+    # Consistent Mass Logic
+    m_kg, mw_avg_kg_per_mol, n_tot = _mixture_mass_and_mw_avg_kg_per_mol(n, atom_vec, atomic_masses)
+    
+    # Prepare EOS args (unpack eos_params)
+    # eos_params is list/tuple: [eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed, v0_fixed, e_fixed, r_star_rho_corr]
+    # Check implicit_eos.py usage
+    eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed, v0_fixed, e_fixed, r_star_rho_corr = eos_params
+
+    # Solve R1(V,T)=0, R2(V,T)=0
+    # Inputs V_guess, T_guess.
+    
+    # If V_guess is m3? or m3/kg?
+    # Expert code says: "V = exp(yV)", "rho = m_kg / V". So V is Volume of system (m3).
+    # ensure guess is valid magnitude
+    V_safe = jnp.maximum(V_guess, 1e-8)
+    T_safe = jnp.maximum(T_guess, 100.0)
+    
+    yV = jnp.log(V_safe)
+    yT = jnp.log(T_safe)
+    
+    def loop_body(carry):
+        yV, yT, it, converged = carry
+        
+        V = jnp.exp(yV)
+        T = jnp.exp(yT)
+        
+        # Call EOS
+        # V must be passed in unit expected by compute_total_helmholtz_energy (m3? cm3?)
+        # expert said: "compute_total looks for V_total". implicit_eos passes V_total_m3.
+        # But wait, implicit_eos passes V_total_m3?
+        # Let's check implicit_eos.py again.
+        # "V_cm3 = V_total_m3 * 1e6"
+        # "return compute_total...(..., Vc=V_cm3, ...)" in `A_of_VT` wrapper.
+        # So compute_total expects cm3.
+        
+        V_cm3 = V * 1e6
+        
+        P_pa, U_total_j, Cv_total_j_k, P_T_pa_k, P_V_pa_m3 = thermo_from_helmholtz(
+            n, V_cm3, T, 
+            coeffs_low, coeffs_high,
+            eps_vec, r_star_vec, alpha_vec, lambda_vec,
+            solid_mask, solid_v0,
+            n_fixed, v0_fixed, e_fixed,
+            r_star_rho_corr,
+            mw_avg=mw_avg_kg_per_mol
+        )
+        
+        # Convert Derivatives from cm3 basis if needed?
+        # thermo_from_helmholtz gradients are w.r.t V_cm3.
+        # P = -dA/dV_cm3 * 1e6?
+        # thermo_from_helmholtz should likely return SI units to be clean.
+        # Let's verify thermo_from_helmholtz implementation above.
+        # It calls A_of_VT(V_total, T). If V_total is cm3, then A_V is J/cm3.
+        # P = -A_V (J/cm3 = MPa). P_pa = P * 1e6.
+        
+        # Let's fix thermo_from_helmholtz to return SI P, P_T, P_V.
+        # If input V is cm3:
+        P_val = P_pa * 1e6
+        P_T_val = P_T_pa_k * 1e6
+        P_V_val = P_V_pa_m3 * 1e12 # J/cm6 -> Pa/m3?
+        # A_VV is J/cm6. P_V = -A_VV. Unit: J/cm6.
+        # J/cm6 = (N m) / (1e-2 m)^6 = 1e12 N m / m^6 = 1e12 N/m5?
+        # P is N/m2. P_V is Pa / m3 = N/m5.
+        # So factor 1e12 from cm6 to m6 is correct (1/1e-12 = 1e12).
+        # WAIT. cm6 = 1e-12 m6.
+        # J/cm6 = J / 1e-12 m6 = 1e12 J/m6.
+        # P_V should be Pa/m3? No. P is in J/V?
+        # dP/dV. P=J/cm3. dP/dV = J/cm6.
+        # 1 J/cm6 = 1e12 J/m6 = 1e12 (N/m2) / m3 ? No. 1 J/m3 = 1 Pa.
+        # dP/dV in SI = Pa / m3.
+        # J/m6 / 1 = Pa/m3.
+        # So yes, 1e12 factor.
+        
+        # Redefine returned values of thermo_from_helmholtz to be raw (J/cm3 basis) or SI?
+        # Let's adjust loop logic to handle SI conversion explicitly.
+        
+        P = P_pa * 1e6 # Pa
+        e = U_total_j / m_kg # J/kg
+        rho = m_kg / V
+        
+        R1 = P + (J**2)*V/m_kg - Pi
+        R2 = e + P/rho + 0.5*(J/rho)**2 - E
+        
+        # Jacobian SI
+        P_T = P_T_pa_k * 1e6
+        P_V = P_V_pa_m3 * 1e12
+        cv_mass = Cv_total_j_k / m_kg
+        
+        dR1_dV = P_V + (J**2)/m_kg
+        dR1_dT = P_T
+
+        # Exp code: dR2_dV = (T*P_T + V*P_V)/m_kg + (J*J)*V/(m_kg*m_kg)
+        # Note: P cancellation trick relies on U_V = -P + T P_T.
+        # U_total_V_cm3 = A_V - T A_VT = -P_raw + T (-P_T_raw).
+        # U_total_V_m3 = (-P/1e6 + T * (-P_T/1e6)) * 1e6 * 1e6 ?? 
+        # Easier to trust SI formulation.
+        
+        dR2_dV = (T * P_T + V * P_V) / m_kg + (J**2 * V) / (m_kg**2)
+        dR2_dT = cv_mass + P_T/rho
+        
+        J11 = dR1_dV * V
+        J12 = dR1_dT * T
+        J21 = dR2_dV * V
+        J22 = dR2_dT * T
+        
+        det = J11*J22 - J12*J21
+        dyV = (J22*(-R1) - J12*(-R2)) / (det + 1e-20)
+        dyT = (-J21*(-R1) + J11*(-R2)) / (det + 1e-20)
+        
+        # Damping
+        damping = 1.0
+        # Simple step limit
+        dist = jnp.sqrt(dyV**2 + dyT**2)
+        scale = jnp.minimum(1.0, 2.0 / (dist + 1e-10))
+        
+        yV_new = yV + dyV * scale
+        yT_new = yT + dyT * scale
+        
+        err = jnp.sqrt(R1**2 + R2**2)
+        converged = err < newton_cfg.tol
+
+        # Debug Newton
+        # jax.debug.print("Newton It {}: R1={:.2e}, R2={:.2e}, det={:.2e}, dyV={:.2e}, dyT={:.2e}, T={:.1f}", it, R1, R2, det, dyV, dyT, T)
+        
+        return (yV_new, yT_new, it+1, converged)
+
+    # Jax While Loop
+    val = (yV, yT, 0, False)
+    cond = lambda v: (v[2] < newton_cfg.max_it) & (~v[3])
+    final_val = jax.lax.while_loop(cond, loop_body, val)
+    
+    yV_f, yT_f, it_f, conv_f = final_val
+    V_f = jnp.exp(yV_f)
+    T_f = jnp.exp(yT_f)
+    rho_f = m_kg / V_f
+    
+    # Return solution and convergence flag
+    return V_f, T_f, rho_f, conv_f
+
+def solve_znd_projection(D, init_state, x_span, eos_data, drag_model, heat_model, q_reaction, n_steps=500):
+    """
+    V11 Patch E: Chemical Explicit + Thermodynamic Projection
+    Replaces explicit integration with algebraic projection on the Rayleigh-Hugoniot path.
+    """
+    atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params = eos_data
+    
+    # 1. Constants & Initialization
+    rho_vn = init_state.gas.rho
+    u_vn = init_state.gas.u
+    T_vn = init_state.gas.T
+    
+    # Get accurate VN properties
+    P_vn_pa, n_vn = get_thermo_properties(rho_vn, T_vn, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params)
+    m_kg, _, _ = _mixture_mass_and_mw_avg_kg_per_mol(n_vn, atom_vec, atomic_masses)
+    V_vn = m_kg / (rho_vn * 1000.0) # rho is g/cm3 -> kg/m3 conversion needed for SI Volume
+    
+    # Calculate System Constants (Unreacted/VN State)
+    # The flow is steady, so Mass, Momentum, Energy fluxes are constant.
+    # CONSTANTS are based on the INITIAL UNREACTED state (upstream of shock).
+    # But init_state passed here is usually VN (Post-Shock).
+    # Momentum J and Pi are preserved across shock.
+    # Energy E is preserved.
+    # J = rho * u. rho in SI (kg/m3).
+    # init_state.rho is g/cm3.
+    J = (rho_vn * 1000.0) * u_vn
+    Pi = P_vn_pa + J**2 / (rho_vn * 1000.0)
+    
+    # Calculate Total Energy E from VN state
+    # Assumption: The VN state provided matches the Rayleight line of the detonation D.
+    # H_vn + 0.5 u_vn^2 = E_total
+    # Note: We treat the fluid as "Product Mixture" conceptually + Potential Heat.
+    # Since n_vn comes from get_thermo_properties, it is the Equilibrium Composition at VN (Shocked).
+    # This is our reference "Product" EOS state.
+    # But physically, VN is Unreacted. 
+    # The "Heat Model" (q_reaction) implies we have extra potential energy (1-lam)*Q.
+    # So E_total (Conserved) = H_prod(VN) + 0.5 u_vn^2 + (1 - lam_vn)*Q
+    # Typically lam_vn ~ 0.
+    lam_0 = 0.0
+    
+    eps_vec, r_star_vec, alpha_vec, lambda_vec, solid_mask, solid_v0, n_fixed, v0_fixed, e_fixed, r_star_rho_corr = eos_params
+    mw_avg_vn = m_kg / jnp.sum(n_vn)
+    
+    # Get VN Internal Energy (Product Basis)
+    V_vn_cm3 = V_vn * 1e6
+    _, U_vn_total, _, _, _ = thermo_from_helmholtz(
+        n_vn, V_vn_cm3, T_vn, 
+        coeffs_low, coeffs_high,
+        eps_vec, r_star_vec, alpha_vec, lambda_vec,
+        solid_mask, solid_v0,
+        n_fixed, v0_fixed, e_fixed,
+        r_star_rho_corr,
+        mw_avg=mw_avg_vn
+    )
+    e_vn = U_vn_total / m_kg # J/kg
+    
+    
+    E_total = e_vn + P_vn_pa/(rho_vn * 1000.0) + 0.5 * u_vn**2 + (1.0 - lam_0) * q_reaction
+    
+    print(f"ZND Projection Start: D={D}, P_vn={P_vn_pa/1e9:.2f} GPa, T_vn={T_vn:.0f} K, E_tot={E_total:.2e}")
+
+    # 2. Stepping Loop
+    # We step lambda from 0 to 1
+    lam_seq = jnp.linspace(0.0, 0.99, n_steps) # Avoid 1.0 singularity
+    
+    history = {
+        'rho': [], 'u': [], 'T': [], 'lam': [], 'x': [], 
+        'P': [], 'a': [], 'M': [], 'sw_det': []
+    }
+    
+    # Init vars
+    V_curr = V_vn
+    T_curr = T_vn
+    n_curr = n_vn
+    x_curr = 0.0
+    t_curr = 0.0
+    
+    # Store step 0
+    a_vn_val = get_sound_speed(rho_vn, T_vn, n_vn, atom_vec, coeffs_low, coeffs_high, eos_params, atomic_masses)
+    history['rho'].append(rho_vn)
+    history['u'].append(u_vn)
+    history['T'].append(T_vn)
+    history['lam'].append(lam_0)
+    history['x'].append(0.0)
+    history['P'].append(P_vn_pa)
+    history['a'].append(a_vn_val)
+    history['M'].append(u_vn/a_vn_val)
+    history['sw_det'].append(1.0) # Dummy det
+
+    for i in range(1, n_steps):
+        lam = lam_seq[i]
+        dlam = lam - lam_seq[i-1]
+        
+        # A. Target Energy for Product EOS
+        # E_prod_target = E_total - (1-lam)*Q
+        E_prod_target = E_total - (1.0 - lam) * q_reaction
+        
+        # B. Composition Guess
+        # Use previous n_curr as guess for Projection
+        # (Assuming composition changes slowly or is frozen for the step)
+        
+        # C. Project (V, T)
+        # Solve R1, R2 for V, T
+        V_new, T_new, rho_new, conv = project_state_to_conservation(
+            n_curr, V_curr, T_curr,
+            J, Pi, E_prod_target,
+            eos_data
+        )
+        
+        if not conv:
+            print(f"Step {i} (lam={lam:.3f}): Projection Failed. Stopping.")
+            break
+            
+        # D. Update Composition (Equilibrium at new V, T)
+        # PDU assumption: Gas is always in local equilibrium (or partial equilibrium)
+        P_tmp, n_new = get_thermo_properties(rho_new, T_new, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params, n_init=n_curr)
+        
+        # Optional: Re-Project with new n? (Corrector)
+        # For precision, yes.
+        V_final, T_final, rho_final, conv_final = project_state_to_conservation(
+            n_new, V_new, T_new,
+            J, Pi, E_prod_target,
+            eos_data
+        )
+        
+        if not conv_final:
+             print(f"Step {i}: Corrector Failed.")
+             break
+        
+        # Update state
+        V_curr = V_final
+        T_curr = T_final
+        n_curr = n_new
+        rho_curr = rho_final
+        u_curr = J / rho_curr
+        P_curr = Pi - J**2 / rho_curr # Consistent P from Momentum
+        
+        # E. Integrate Space/Time
+        # Rate Calculation
+        P_gpa = P_curr / 1e9
+        k_p = 1000.0 # Consistent with older code
+        n_p = 2.0
+        rate = k_p * (jnp.maximum(P_gpa, 0.0)**n_p) * (1.0 - lam)
+        rate = jnp.maximum(rate, 1e-10) # Avoid div zero
+        
+        dt = dlam / rate
+        dx = u_curr * dt
+        
+        x_curr += dx
+        t_curr += dt
+        
+        # F. Sonic Check (Patch E3)
+        # Verify if we hit CJ
+        a_curr = get_sound_speed(rho_curr, T_curr, n_curr, atom_vec, coeffs_low, coeffs_high, eos_params, atomic_masses)
+        M_curr = u_curr / a_curr
+        
+        sonic_crit = 1.0 - M_curr
+        
+        # Store
+        history['rho'].append(rho_curr)
+        history['u'].append(u_curr)
+        history['T'].append(T_curr)
+        history['lam'].append(lam)
+        history['x'].append(x_curr)
+        history['P'].append(P_curr)
+        history['a'].append(a_curr)
+        history['M'].append(M_curr)
+        history['sw_det'].append(0.0) # placeholder
+
+        if jnp.abs(sonic_crit) < 1e-3:
+            print(f"Sonic Point Reached at lam={lam:.3f}, M={M_curr:.4f}. Stopping.")
+            break
+        
+        if M_curr > 1.02: # Overshoot check (if we jumped to Weak solution?)
+            # Usually Strong solution starts M < 1 and goes to M=1.
+            # If M > 1, we might have crossed CJ.
+            print(f"Supersonic flow detected (M={M_curr:.3f}). Stopping.")
+            break
+
+    # Pack Solution
+    class Sol:
+        pass
+    sol = Sol()
+    # Convert to jnp arrays
+    for k, v in history.items():
+        setattr(sol, k, jnp.array(v))
+        
+    sol.gas = GasState(
+        rho=sol.rho,
+        u=sol.u,
+        T=sol.T,
+        lam=sol.lam
+    )
+    # Fake ys for compatibility if need be
+    return sol
+
+# Alias to replace old solver
+solve_znd_profile = solve_znd_projection
 
 def shooting_residual(D, init_state, x_span, eos_data, drag_model, heat_model, q_reaction):
     """
