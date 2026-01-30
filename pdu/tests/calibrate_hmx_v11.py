@@ -35,7 +35,7 @@ def calibrate_hmx():
     for s in SPECIES_LIST:
         p = v7_params[s]
         eps.append(p.get('epsilon_over_k', 100.0))
-        r.append(p.get('r_star', 3.5))
+        r.append(3.1) # FORCE 3.1 (Override JSON to fix 992 GPa overpacking)
         alpha.append(p.get('alpha', 13.0))
         lam.append(p.get('lambda_ree', 0.0))
     
@@ -107,8 +107,14 @@ def calibrate_hmx():
     print(f"  u = {u_f:.1f} m/s")
     
     # 打印剖面简报
-    print("\nProfile Overview (lam):")
+    print("\nProfile Overview (lam start):")
     print(sol.gas.lam[:10])
+    
+    print("\nTrajectory Tail (Last 10 points):")
+    print(f"P (GPa): {sol.P[-10:]/1e9}")
+    print(f"T (K):   {sol.T[-10:]}")
+    print(f"u (m/s): {sol.u[-10:]}")
+    print(f"lam:     {sol.gas.lam[-10:]}")
     
     # 计算误差
     p_err = (P_f/1e9 - P_exp) / P_exp

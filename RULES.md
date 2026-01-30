@@ -1,5 +1,11 @@
 # PyDetonation-Ultra (PDU) 开发规则
 
+## **CRITICAL PROTOCOL: SKILL-FIRST WORKFLOW (MANDATORY)**
+**RULE #1:** Whenever you encounter a problem, need to implement a feature, or plan a task, you **MUST FIRST** search the `/home/jcl/HDY/PyDetonation-Ultra/.agent/skills` directory.
+- **Action**: Use `find_by_name` or `grep_search` to find relevant skills.
+- **Integration**: Explicitly cite the skill you are using in your plan and follow its instructions.
+- **Failure to check skills first is a violation of project rules.**
+
 ## 0. 项目目标与核心功能
 
 ### 0.1 正向计算：全面爆轰性能预测

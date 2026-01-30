@@ -47,7 +47,9 @@ def znd_desingularized_field(xi, state, args):
     # 反应时间尺度 τ ~ 1/(k_p * 900) 秒
     # 若 τ ~ 1 μs = 1e-6 s, 则 k_p ~ 1e6/900 ~ 1e3
     p_gpa = P_pa / 1e9
-    k_p = 10.0  # 修正后的反应速率常数 [1/(s·GPa^n)]
+    p_gpa = P_pa / 1e9
+    k_p = 1000.0  # Tuned: 100.0 -> 1000.0 (aggressive heating to fix T crash)
+    n_p = 2.0
     n_p = 2.0
     # 物理约束: lam ∈ [0, 1], 反应只能前进，不能反向
     lam_clipped = jnp.clip(lam, 0.0, 1.0)
@@ -162,11 +164,20 @@ def solve_znd_profile(D, init_state, x_span, eos_data, drag_model, heat_model, q
         # ---------------------------------------------------------
         rho_n, u_n, T_n, lam_n, x_n = y_next
         
-        # 1. NaN / Inf 检查
         if not jnp.all(jnp.isfinite(y_next)):
             print(f"Step {step}: Reject (NaN detected). Shrinking dxi {dxi:.2e} -> {dxi*0.5:.2e}")
             dxi *= 0.5
             continue
+
+        # 1.5 Physical Realm Check (Early Reject)
+        if T_n < 100.0:
+             print(f"Step {step}: Reject (T < 100K: {T_n:.2f}). Shrinking...")
+             dxi *= 0.5
+             continue
+        if rho_n < 0.1:
+             print(f"Step {step}: Reject (rho too low: {rho_n:.2f}). Shrinking...")
+             dxi *= 0.5
+             continue
 
         # 2. 物理约束检查 (EOS / 声速)
         try:

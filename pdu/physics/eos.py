@@ -186,7 +186,10 @@ def compute_total_helmholtz_energy(
     
     n_solid, n_gas = n * solid_mask, n * (1.0 - solid_mask)
     n_gas_total = jnp.sum(n_gas) + 1e-30
-    jax.debug.print("rho={r}, n_gas_total={ngt}", r=rho_macro, ngt=n_gas_total)
+    n_gas_total = jnp.sum(n_gas) + 1e-30
+    # jax.debug.print("rho={r}, n_gas_total={ngt}", r=rho_macro, ngt=n_gas_total)
+    
+    P_proxy = (n_gas_total * 8.314 * T) / (V_total * 0.6 * 1e-6)
     
     P_proxy = (n_gas_total * 8.314 * T) / (V_total * 0.6 * 1e-6) 
     P_proxy = jnp.maximum(P_proxy, 1e5)
@@ -231,7 +234,10 @@ def compute_total_helmholtz_energy(
     A_bar = n_gas_total * R * T * K_ETA * (over / OVER_W) ** 2
     
     A_excess_hs = A_cs + A_bar
-    jax.debug.print("T={t}, V_gas={v}, eta_raw={e}, A_hs={a}", t=T, v=V_gas_eff, e=eta_raw, a=A_excess_hs)
+    A_excess_hs = A_cs + A_bar
+    # jax.debug.print("T={t}, V_gas={v}, eta_raw={e}, A_hs={a}", t=T, v=V_gas_eff, e=eta_raw, a=A_excess_hs)
+    
+    U_attr = - ((2.0 * jnp.pi / 3.0) * (N_AVOGADRO**2) * K_BOLTZMANN * 1e-24 * jnp.sum(jnp.outer(n_gas, n_gas) * eps_mat * r_mat**3)) / V_gas_eff
     
     U_attr = - ((2.0 * jnp.pi / 3.0) * (N_AVOGADRO**2) * K_BOLTZMANN * 1e-24 * jnp.sum(jnp.outer(n_gas, n_gas) * eps_mat * r_mat**3)) / V_gas_eff
     
@@ -243,7 +249,9 @@ def compute_total_helmholtz_energy(
     A_solid_fixed = n_fixed_solids * (e_fixed_solids + cv_al_eff * (T - 298.0) - T * (28.3 + cv_al_eff * jnp.log(jnp.maximum(T / 298.0, 1e-3))))
     
     A_val = A_gas_total + A_solid_eq + A_solid_fixed
-    jax.debug.print("A_final={a}, A_rep={rep}", a=A_val, rep=A_rep)
+    A_val = A_gas_total + A_solid_eq + A_solid_fixed
+    # jax.debug.print("A_final={a}, A_rep={rep}", a=A_val, rep=A_rep)
+    return A_val
     return A_val
 
 # Hoisted Differentiation: Define core gradient functions once at top level

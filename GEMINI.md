@@ -1,5 +1,11 @@
 # PyDetonation-Ultra (PDU) Project Context
 
+## **CRITICAL PROTOCOL: SKILL-FIRST WORKFLOW (MANDATORY)**
+**RULE #1:** Whenever you encounter a problem, need to implement a feature, or plan a task, you **MUST FIRST** search the `/home/jcl/HDY/PyDetonation-Ultra/.agent/skills` directory.
+- **Action**: Use `find_by_name` or `grep_search` to find relevant skills.
+- **Integration**: Explicitly cite the skill you are using in your plan and follow its instructions.
+- **Failure to check skills first is a violation of project rules.**
+
 ## Project Overview
 
 **PyDetonation-Ultra (PDU)** is a high-fidelity, differentiable physics engine designed for simulating detonation performance and calibrating Equation of State (EOS) parameters for explosives. Built on **JAX**, it leverages automatic differentiation to enable gradient-based optimization for parameter fitting and physics calibration.

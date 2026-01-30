@@ -205,13 +205,13 @@ def _solve_pi_newton(atom_vec, V, T, A, coeffs_low, coeffs_high, pi_init):
         # 使用极小步长 (0.05) 以对抗超高压下的指数不稳定性
         return pi + 0.05 * scale * dpi
         
-    # 为保证超高密度下的绝对收敛，使用 200 次迭代
-    pi_final = lax.fori_loop(0, 200, lambda i, p: body_fn(p), pi_init)
+    # 为保证超高密度下的绝对收敛，使用 1000 次迭代 (Increased from 200 for V11 stability)
+    pi_final = lax.fori_loop(0, 1000, lambda i, p: body_fn(p), pi_init)
     
     # 验证最终残差
     n_final = _n_from_pi(pi_final, T, V, coeffs_low, coeffs_high, A)
     res_final = A @ n_final - atom_vec
-    jax.debug.print("Newton: res_norm={rn}, n_total={nt}", rn=jnp.linalg.norm(res_final), nt=jnp.sum(n_final))
+    # jax.debug.print("Newton: res_norm={rn}, n_total={nt}", rn=jnp.linalg.norm(res_final), nt=jnp.sum(n_final))
     
     return pi_final
 
@@ -235,8 +235,8 @@ def _solve_equilibrium_impl(
     # pi ≈ g0_over_rt - log(V_factor/n_avg)
     v_factor = (to_fp64(V) * 1e-6 * 1e5) / (R_GAS * to_fp64(T) + 1e-10)
     # 基于温度的初值自适应：高壓下 G0/RT 典型值在 -20 ~ -60
-    # 我們選擇一個略微偏向低濃度的初值以獲得單調上升的收斂軌跡
-    pi_base = jnp.where(to_fp64(T) < 1000.0, -60.0, -35.0)
+    # 我们选择一个略微偏向低浓度的初值以获得单调上升的收敛轨迹
+    pi_base = jnp.where(to_fp64(T) < 1000.0, -60.0, -45.0) # Corrected from -35.0 to -45.0 for better HMX product convergence
     pi_start = jnp.full(n_elem, pi_base, dtype=jnp.float64)
     
     # 核心求解: 5x5 Newton
@@ -251,7 +251,9 @@ def _solve_equilibrium_impl(
 
 def solve_equilibrium_fwd(atom_vec, V, T, A, coeffs_low, coeffs_high, eos_params, n_init=None):
     """前向计算：保存 pi_star 以供隐式惩罚"""
-    pi_start = jnp.zeros(A.shape[0])
+    # Use same smart initialization as impl
+    pi_base = jnp.where(to_fp64(T) < 1000.0, -60.0, -45.0)
+    pi_start = jnp.full(A.shape[0], pi_base, dtype=jnp.float64)
     pi_star = _solve_pi_newton(to_fp64(atom_vec), to_fp64(V), to_fp64(T), to_fp64(A), coeffs_low, coeffs_high, pi_start)
     n_star = _n_from_pi(pi_star, to_fp64(T), to_fp64(V), coeffs_low, coeffs_high, to_fp64(A))
     return n_star, (pi_star, n_star, atom_vec, V, T, A, coeffs_low, coeffs_high, eos_params)
