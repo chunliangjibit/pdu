@@ -1,9 +1,4 @@
-"""
-JCZ3 状态方程模块
-
-基于 Exp-6 势能的高压状态方程，用于计算爆轰产物的 P-V-T 关系。
-利用 JAX 自动微分计算化学势 (mu = dA/dn)。
-"""
+from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
@@ -81,6 +76,14 @@ class JCZ3EOS:
             coeffs_all=coeffs_all
         )
 
+# Hoisted vmap for better compilation stability
+def _get_thermo_single(coeffs_low, coeffs_high, T):
+    u_val = jnp.where(T > 1000.0, compute_u_ideal(coeffs_high, T), compute_u_ideal(coeffs_low, T))
+    s_val = jnp.where(T > 1000.0, compute_entropy(coeffs_high, T), compute_entropy(coeffs_low, T))
+    return u_val, s_val
+
+_get_thermo_vec = jax.vmap(_get_thermo_single, in_axes=(0, 0, None))
+
 @jax.jit
 def compute_effective_diameter_ratio(T, epsilon, alpha):
     """Calculate d/r* ratio based on Temperature"""
@@ -132,40 +135,33 @@ def compute_covolume(n, r_star_matrix, T, epsilon_matrix, alpha_matrix, rho_impa
     return (2.0 * jnp.pi / 3.0) * N_AVOGADRO * (sum_nd3 / n_total)
 
 @jax.jit
-def alpha_hardening(rho, alpha0, k=10.0, rho_crit=1.8, w=0.1):
+def alpha_hardening(rho, alpha0, k=0.0, rho_crit=2.2, w=0.1):
     """
-    密度依赖的 alpha 硬化 (V11.0 Ross修正)
-    针对 HMX 高压 >35GPa 区域提升刚性。
+    密度依赖的 alpha 硬化 (V11.0 Disable for baseline)
     """
-    # 确保 rho 和 alpha0 形状一致或能广播
     return alpha0 + k * jax.nn.softplus((rho - rho_crit) / w)
 
-@jax.jit
 def compute_total_helmholtz_energy(
-    n, V_total, T, coeffs_all, 
+    n, V_total, T, coeffs_low, coeffs_high,
     eps_vec, r_star_vec, alpha_vec, lambda_vec,
-    solid_mask=None, solid_v0=None,
+    solid_mask, solid_v0,
     n_fixed_solids=0.0, v0_fixed_solids=10.0, e_fixed_solids=0.0,
     r_star_rho_corr=0.0,
-    mw_avg=20.0  # 新增: 平均分子量用于硬化计算
+    mw_avg=1.0
 ):
-    n, V_total, T = to_fp64(n), to_fp64(V_total), to_fp64(T)
+    # V11 Phase 4: Enforce FP64 for thermodynamic consistency at super-high density
+    n = jnp.asarray(n, dtype=jnp.float64)
+    V_total = jnp.asarray(V_total, dtype=jnp.float64)
+    T = jnp.asarray(T, dtype=jnp.float64)
     R = R_GAS
     
-    # 计算当前宏观密度 (g/cm3) 用于硬化
-    # rho = Mass / Volume = (n_total_equivalent * MW_equivalent) / V_total
-    # 在 PDU 框架下，V_total 是对应 1 mol 等效原药的体积，故 Mass = mw_avg
     rho_macro = mw_avg / (V_total + 1e-10)
-    
-    # 动态硬化 alpha
     alpha_hardened = alpha_hardening(rho_macro, alpha_vec)
     
-    if solid_mask is None: solid_mask = jnp.zeros_like(n)
-    if solid_v0 is None: solid_v0 = jnp.zeros_like(n)
     n_solid, n_gas = n * solid_mask, n * (1.0 - solid_mask)
     n_gas_total = jnp.sum(n_gas) + 1e-30
+    jax.debug.print("rho={r}, n_gas_total={ngt}", r=rho_macro, ngt=n_gas_total)
     
-    # 估算压力用于固相压缩
     P_proxy = (n_gas_total * 8.314 * T) / (V_total * 0.6 * 1e-6) 
     P_proxy = jnp.maximum(P_proxy, 1e5)
     is_carbon = (solid_v0 > 5.0) & (solid_v0 < 6.0)
@@ -181,48 +177,66 @@ def compute_total_helmholtz_energy(
 
     # 气相非理想
     eps_mat, r_mat, alpha_mat = compute_mixed_matrices_dynamic(T, eps_vec, r_star_vec, alpha_hardened, lambda_vec)
-    def get_thermo(c): return compute_u_ideal(c, T), compute_entropy(c, T)
-    u_vec, s0_vec = jax.vmap(get_thermo)(coeffs_all)
+    u_vec, s0_vec = _get_thermo_vec(coeffs_low, coeffs_high, T)
     
     n_gas_safe = jnp.maximum(n_gas, 1e-15)
     A_gas_ideal = jnp.sum(n_gas * (u_vec - T * s0_vec)) + R * T * jnp.sum(jnp.where(n_gas > 1e-18, n_gas * jnp.log((n_gas_safe * R * T) / (V_gas_m3 * 1e5)), 0.0))
     
     B_total_gas = compute_covolume(n_gas, r_mat, T, eps_mat, alpha_mat, r_star_rho_corr)
     eta = B_total_gas / (4.0 * V_gas_eff)
-    eta_limit = 0.74
-    eta = eta_limit * jnp.tanh(eta / eta_limit)
-    A_excess_hs = n_gas_total * R * T * (4.0*eta - 3.0*eta**2) / jnp.maximum((1.0 - eta)**2, 1e-6)
+    jax.debug.print("T={t}, V_gas={v}, eta_raw={e}", t=T, v=V_gas_eff, e=eta)
+    # V11 Phase 4: 直接使用 eta 以保持压强刚性，依靠分母 maximum(1-eta, 0.05) 保证数值安全
+    A_excess_hs = n_gas_total * R * T * (4.0*eta - 3.0*eta**2) / (jnp.maximum(1.0 - eta, 0.05)**2)
     
     U_attr = - ((2.0 * jnp.pi / 3.0) * (N_AVOGADRO**2) * K_BOLTZMANN * 1e-24 * jnp.sum(jnp.outer(n_gas, n_gas) * eps_mat * r_mat**3)) / V_gas_eff
     
-    # V8.6 Tuning: C_stiff = 150.0 (Hardened to ensure subsonic post-shock flow for HMX)
-    A_rep = n_gas_total * R * T * 150.0 * (eta**4)
+    # V11.0 Phase 4 Hardening: Baseline (Disabled)
+    A_rep = n_gas_total * R * T * 0.0 * (eta**4) / jnp.maximum(1.0 - eta, 0.05)
     A_gas_total = A_gas_ideal + A_excess_hs + U_attr + A_rep
 
-    # 固相
     A_solid_eq = jnp.sum(n_solid * (u_vec - T * s0_vec))
     cv_al_eff = 45.0
     A_solid_fixed = n_fixed_solids * (e_fixed_solids + cv_al_eff * (T - 298.0) - T * (28.3 + cv_al_eff * jnp.log(jnp.maximum(T / 298.0, 1e-3))))
     
-    return A_gas_total + A_solid_eq + A_solid_fixed
+    A_val = A_gas_total + A_solid_eq + A_solid_fixed
+    jax.debug.print("A_final={a}, A_rep={rep}", a=A_val, rep=A_rep)
+    return A_val
 
-def compute_pressure_jcz3(*args, **kwargs):
-    grad_fn = jax.grad(compute_total_helmholtz_energy, argnums=1)
-    return -grad_fn(*args, **kwargs) * 1e6
+# Hoisted Differentiation: Define core gradient functions once at top level
+_energy_grad_n_raw = jax.grad(compute_total_helmholtz_energy, argnums=0)
+_energy_grad_V_raw = jax.grad(compute_total_helmholtz_energy, argnums=1)
+_energy_grad_T_raw = jax.grad(compute_total_helmholtz_energy, argnums=2)
+_energy_val_grad_n_raw = jax.value_and_grad(compute_total_helmholtz_energy, argnums=0)
 
-def compute_internal_energy_jcz3(*args, **kwargs):
-    grad_T_fn = jax.grad(compute_total_helmholtz_energy, argnums=2)
-    A = compute_total_helmholtz_energy(*args, **kwargs)
-    T = to_fp64(args[2])
-    U_raw = A - T * grad_T_fn(*args, **kwargs)
-    # Cage Effect Correction
-    P_pa = compute_pressure_jcz3(*args, **kwargs)
+@jax.jit
+def compute_pressure_jcz3(n, V_total, T, coeffs_low, coeffs_high, *args):
+    """Jit-friendly pressure calculation using hoisted grad"""
+    return -_energy_grad_V_raw(n, V_total, T, coeffs_low, coeffs_high, *args) * 1e6
+
+@jax.jit
+def compute_internal_energy_jcz3(n, V_total, T, coeffs_low, coeffs_high, *args):
+    """Jit-friendly internal energy calculation"""
+    A = compute_total_helmholtz_energy(n, V_total, T, coeffs_low, coeffs_high, *args)
+    grad_T = _energy_grad_T_raw(n, V_total, T, coeffs_low, coeffs_high, *args)
+    U_raw = A - T * grad_T
+    
+    # Cage Effect (Physics correction)
+    P_pa = -_energy_grad_V_raw(n, V_total, T, coeffs_low, coeffs_high, *args) * 1e6
     P_gpa = P_pa * 1e-9
     corr_factor = 1.0 / (1.0 + (P_gpa / 60.0)**2 * 0.15)
     return U_raw * corr_factor
 
-def compute_chemical_potential_jcz3(*args, **kwargs):
-    return jax.grad(compute_total_helmholtz_energy, argnums=0)(*args, **kwargs)
+@jax.jit
+def compute_chemical_potential_jcz3(n, V_total, T, coeffs_low, coeffs_high, *args):
+    """Jit-friendly chemical potential using hoisted grad"""
+    return _energy_grad_n_raw(n, V_total, T, coeffs_low, coeffs_high, *args)
 
-def compute_entropy_consistent(*args, **kwargs):
-    return -jax.grad(compute_total_helmholtz_energy, argnums=2)(*args, **kwargs)
+@jax.jit
+def compute_entropy_consistent(n, V_total, T, coeffs_low, coeffs_high, *args):
+    """Jit-friendly entropy calculation"""
+    return -_energy_grad_T_raw(n, V_total, T, coeffs_low, coeffs_high, *args)
+
+@jax.jit
+def compute_A_and_mu_jcz3(n, V_total, T, coeffs_low, coeffs_high, *args):
+    """Optimized A and mu calculation using value_and_grad"""
+    return _energy_val_grad_n_raw(n, V_total, T, coeffs_low, coeffs_high, *args)

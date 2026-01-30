@@ -104,6 +104,20 @@ def compute_gibbs(coeffs: jnp.ndarray, T: float, P: float = 1e5) -> float:
     return G
 
 
+# Hoisted vmap for chemical potential
+def _compute_chemical_potential_raw(coeffs, T, n_i, n_total, P):
+    """Internal raw function for vmapping"""
+    H = compute_enthalpy(coeffs, T)
+    S = compute_entropy(coeffs, T)
+    G0 = H - T * S
+    x_i = n_i / (n_total + 1e-30)
+    P0 = 1e5
+    mu = G0 + R_GAS * T * jnp.log(jnp.maximum(x_i * P / P0, 1e-30))
+    return mu
+
+# Vmap over coeffs (0) and n_i (2), while T, n_total, P are constant (None)
+_compute_chemical_potential_vec = jax.vmap(_compute_chemical_potential_raw, in_axes=(0, None, 0, None, None))
+
 @jax.jit
 def compute_chemical_potential(
     coeffs: jnp.ndarray, 
@@ -117,13 +131,7 @@ def compute_chemical_potential(
     n_i = to_fp64(jnp.asarray(n_i))
     n_total = to_fp64(jnp.asarray(n_total))
     P = to_fp64(jnp.asarray(P))
-    H = compute_enthalpy(coeffs, T)
-    S = compute_entropy(coeffs, T)
-    G0 = H - T * S
-    x_i = n_i / (n_total + 1e-30)
-    P0 = 1e5
-    mu = G0 + R_GAS * T * jnp.log(jnp.maximum(x_i * P / P0, 1e-30))
-    return mu
+    return _compute_chemical_potential_raw(coeffs, T, n_i, n_total, P)
 
 
 @partial(jax.jit, static_argnums=(2,))
@@ -139,6 +147,5 @@ def compute_gibbs_batch(
     n = to_fp64(n)
     P = to_fp64(jnp.asarray(P))
     n_total = jnp.sum(n) + 1e-30
-    def compute_single_mu(coeffs, n_i):
-        return compute_chemical_potential(coeffs, T, n_i, n_total, P)
-    return jax.vmap(compute_single_mu)(coeffs_all, n)
+    return _compute_chemical_potential_vec(coeffs_all, T, n, n_total, P)
+

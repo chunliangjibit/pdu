@@ -27,18 +27,18 @@ def znd_desingularized_field(xi, state, args):
     x = state[4]
     
     eos_data, drag_model, heat_model, D, q_reaction = args
-    atom_vec, coeffs_all, A_matrix, atomic_masses, eos_params = eos_data
+    atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params = eos_data
     
     # 1. 状态解析 (隐式 EOS) - 代数求解，不作为微分变量
     P_pa, n_gas = get_thermo_properties(
         rho, T, 
-        atom_vec, coeffs_all, A_matrix, atomic_masses, eos_params
+        atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params
     )
     
     # 获取精确声速
     a_gas = get_sound_speed(
         rho, T, n_gas, 
-        atom_vec, coeffs_all, eos_params, atomic_masses
+        atom_vec, coeffs_low, coeffs_high, eos_params, atomic_masses
     )
     
     # 2. 化学动力学 (P-dependent)
@@ -47,16 +47,19 @@ def znd_desingularized_field(xi, state, args):
     # 反应时间尺度 τ ~ 1/(k_p * 900) 秒
     # 若 τ ~ 1 μs = 1e-6 s, 则 k_p ~ 1e6/900 ~ 1e3
     p_gpa = P_pa / 1e9
-    k_p = 1e3  # 修正后的反应速率常数 [1/(s·GPa^n)]
+    k_p = 10.0  # 修正后的反应速率常数 [1/(s·GPa^n)]
     n_p = 2.0
     # 物理约束: lam ∈ [0, 1], 反应只能前进，不能反向
     lam_clipped = jnp.clip(lam, 0.0, 1.0)
     remaining_reactant = jnp.maximum(1.0 - lam_clipped, 0.0)  # 确保非负
     dlam_dt = k_p * (jnp.maximum(p_gpa, 0.0)**n_p) * remaining_reactant
+    dlam_dt = jnp.minimum(dlam_dt, 1e5) # 动力学截止限制 (V11.0 Phase 4)
     
-    # 3. 核心去奇异化变换
+    # 3. 核心去奇异化变换 (V11.0 Phase 4: Regularized)
     M2 = (u / a_gas)**2
-    singularity_factor = 1.0 - M2
+    epsilon_sonic = 1e-4 # 对冲奇异性的微小扰动
+    # 物理驱动力: 在反应区内 M < 1, singularity_factor 应为正
+    singularity_factor = 1.0 - M2 + epsilon_sonic
     
     # 放热系数 sigma (简化版，后续用 AD 替代)
     gamma_eff = 3.0
@@ -67,17 +70,29 @@ def znd_desingularized_field(xi, state, args):
     
     # 去奇异化后的导数
     dp_dxi = -numerator  # dP/dxi = -Numerator (分子项)
-    dx_dxi = singularity_factor  # dx/dxi = 1 - M^2 (分母项)
-    du_dxi = -dp_dxi / (rho * u + 1e-10)  # 动量守恒
-    drho_dxi = -(rho / (u + 1e-6)) * du_dxi  # 质量守恒
+    dx_dxi = jnp.maximum(singularity_factor, 1e-6)  # 物理约束: x 轴只能正向演化
+    du_dxi = -dp_dxi / (jnp.maximum(rho * u, 1e-3) + 1e-10)  # 动量守恒 (防止除以零)
+    drho_dxi = -(rho / (jnp.maximum(u, 10.0) + 1e-6)) * du_dxi  # 质量守恒
     
-    cv_gas = 2500.0
-    dt_dxi = (-P_pa * du_dxi / (rho * u + 1e-10)) / cv_gas  # 能量守恒
-    dlam_dxi = (dlam_dt / (u + 1e-6)) * singularity_factor
+    cv_gas = 1500.0 # HMX 典型值
+    # 能量守恒: dT/dxi = (放热率 - 膨胀功) / (rho * Cv * dx/dxi)
+    # 在 xi 空间中: dT/dxi = (q_reaction * dlam/dxi - P_pa * d(1/rho)/dxi) / cv_gas
+    # d(1/rho)/dxi = -(1/rho^2) * drho/dxi = (1/(rho*u)) * du/dxi
+    dt_exothermic = (q_reaction * dlam_dt / (u + 1e-6)) / cv_gas 
+    dt_expansion = (P_pa * du_dxi / (rho * u + 1e-10)) / cv_gas
+    dt_dxi = (dt_exothermic - dt_expansion)
+    dlam_dxi = (dlam_dt / (u + 1e-6)) * jnp.maximum(singularity_factor, 1e-4) # 物理约束：反应度只能正向增加
+    
+    # 5. 状态裁剪与安全返回 (防止数值漂移)
+    drho_dxi = jnp.nan_to_num(drho_dxi, 0.0)
+    du_dxi = jnp.nan_to_num(du_dxi, 0.0)
+    dt_dxi = jnp.nan_to_num(dt_dxi, 0.0)
+    dlam_dxi = jnp.nan_to_num(dlam_dxi, 0.0)
+    dx_dxi = jnp.nan_to_num(dx_dxi, 1e-6)
     
     return jnp.array([drho_dxi, du_dxi, dt_dxi, dlam_dxi, dx_dxi])
 
-def solve_znd_profile(D, init_state, x_span, eos_data, drag_model, heat_model, q_reaction, n_steps=500):
+def solve_znd_profile(D, init_state, x_span, eos_data, drag_model, heat_model, q_reaction, n_steps=1000):
     """
     Phase 1 简化版 ZND 求解器
     使用 5 维状态向量 [rho, u, T, lam, x]，移除 n 以消除刚性。
@@ -102,15 +117,16 @@ def solve_znd_profile(D, init_state, x_span, eos_data, drag_model, heat_model, q
         diffrax.ODETerm(znd_desingularized_field),
         solver,
         t0=0.0,
-        t1=10.0,  # 伪时间预算 (增加以适应较慢的反应速率)
-        dt0=1e-6,
+        t1=1.0,  # 伪时间预算 (调整为 1.0)
+        dt0=1e-5,
         y0=y0,
         args=args,
-        max_steps=10000,
+        max_steps=50000, # 增加步数限制
         stepsize_controller=stepsize_controller,
-        saveat=diffrax.SaveAt(steps=True),  # 保存完整轨迹用于调试
+        saveat=diffrax.SaveAt(steps=True),
         adjoint=diffrax.RecursiveCheckpointAdjoint()
     )
+
     
     class Sol:
         def __init__(self, sol_diffrax):
@@ -149,9 +165,9 @@ def shooting_residual(D, init_state, x_span, eos_data, drag_model, heat_model, q
     T_f = sol.gas.T[-1]
     lam_f = sol.gas.lam[-1]
     
-    atom_vec, coeffs_all, A_matrix, atomic_masses, eos_params = eos_data
-    P_f, n_f = get_thermo_properties(rho_f, T_f, atom_vec, coeffs_all, A_matrix, atomic_masses, eos_params)
-    cs_f = get_sound_speed(rho_f, T_f, n_f, atom_vec, coeffs_all, eos_params, atomic_masses)
+    atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params = eos_data
+    P_f, n_f = get_thermo_properties(rho_f, T_f, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params)
+    cs_f = get_sound_speed(rho_f, T_f, n_f, atom_vec, coeffs_low, coeffs_high, eos_params, atomic_masses)
     
     # 计算终点的分子项和分母项
     M_f = u_f / cs_f
@@ -159,7 +175,7 @@ def shooting_residual(D, init_state, x_span, eos_data, drag_model, heat_model, q
     
     # 重新计算分子项 (dP/dxi)
     p_gpa_f = P_f / 1e9
-    k_p = 1e3  # 与向量场保持一致
+    k_p = 10.0  # 与向量场保持一致
     n_p = 2.0
     dlam_dt_f = k_p * (jnp.maximum(p_gpa_f, 0.0)**n_p) * (1.0 - lam_f)
     gamma_eff = 3.0

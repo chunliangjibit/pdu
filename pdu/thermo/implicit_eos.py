@@ -21,10 +21,9 @@ class ThermoState(NamedTuple):
     n: jnp.ndarray 
 
 @custom_jvp
-def get_thermo_properties(rho, T, atom_vec, coeffs_all, A_matrix, atomic_masses, eos_params, n_init=None):
+def get_thermo_properties(rho, T, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params, n_init=None):
     """
     给定 rho, T -> 计算平衡组分 n，返回 P, n
-    支持 n_init (Warm-Start)
     """
     rho_64 = to_fp64(rho)
     T_64 = to_fp64(T)
@@ -32,10 +31,10 @@ def get_thermo_properties(rho, T, atom_vec, coeffs_all, A_matrix, atomic_masses,
     mw_g_per_mol = jnp.dot(atom_vec, atomic_masses)
     V_molar = mw_g_per_mol / (rho_64 + 1e-10)
     
-    n_final = solve_equilibrium(atom_vec, V_molar, T_64, A_matrix, coeffs_all, eos_params, n_init)
+    n_final = solve_equilibrium(atom_vec, V_molar, T_64, A_matrix, coeffs_low, coeffs_high, eos_params, n_init)
     
     P_pa = compute_pressure_jcz3(
-        n_final, V_molar, T_64, coeffs_all, 
+        n_final, V_molar, T_64, coeffs_low, coeffs_high,
         eos_params[0], eos_params[1], eos_params[2], eos_params[3],
         eos_params[4], eos_params[5], 
         eos_params[6], eos_params[7], eos_params[8],
@@ -48,10 +47,10 @@ def get_thermo_properties(rho, T, atom_vec, coeffs_all, A_matrix, atomic_masses,
 @get_thermo_properties.defjvp
 def get_thermo_properties_jvp(primals, tangents):
     # n_init is currently treated as non-diff or zero-tan
-    rho, T, atom_vec, coeffs_all, A_matrix, atomic_masses, eos_params, n_init = primals
-    d_rho, d_T, d_atom_vec, d_coeffs_all, d_A_matrix, d_atomic_masses, d_eos_params, d_n_init = tangents
+    rho, T, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params, n_init = primals
+    d_rho, d_T, d_atom_vec, d_cl, d_ch, d_A, d_masses, d_eos, d_ni = tangents
     
-    P, n = get_thermo_properties(rho, T, atom_vec, coeffs_all, A_matrix, atomic_masses, eos_params, n_init)
+    P, n = get_thermo_properties(rho, T, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params, n_init)
     
     rho_64 = to_fp64(rho)
     T_64 = to_fp64(T)
@@ -60,7 +59,7 @@ def get_thermo_properties_jvp(primals, tangents):
 
     def p_func(r, t):
         v = mw_g_per_mol / (r + 1e-10)
-        return compute_pressure_jcz3(n_64, v, t, coeffs_all, *eos_params, mw_g_per_mol)
+        return compute_pressure_jcz3(n_64, v, t, coeffs_low, coeffs_high, *eos_params, mw_g_per_mol)
 
     dP_drho, dP_dT = jax.grad(p_func, argnums=(0, 1))(rho_64, T_64)
     dP_total = dP_drho * d_rho + dP_dT * d_T
@@ -68,10 +67,9 @@ def get_thermo_properties_jvp(primals, tangents):
     return (P, n), (to_fp32(dP_total), jnp.zeros_like(n))
 
 @jit
-def get_sound_speed(rho, T, n, atom_vec, coeffs_all, eos_params, atomic_masses):
+def get_sound_speed(rho, T, n, atom_vec, coeffs_low, coeffs_high, eos_params, atomic_masses):
     """
     计算冻结声速 (Frozen Sound Speed)
-    a^2 = (dP/drho)_s = (dP/drho)_T + (dP/dT)_rho * (T * (dP/dT)_rho) / (rho^2 * Cv)
     """
     rho_64 = to_fp64(rho)
     T_64 = to_fp64(T)
@@ -80,11 +78,11 @@ def get_sound_speed(rho, T, n, atom_vec, coeffs_all, eos_params, atomic_masses):
     
     def p_func(r, t):
         v = mw_g_per_mol / (r + 1e-10)
-        return compute_pressure_jcz3(n_64, v, t, coeffs_all, *eos_params, mw_g_per_mol)
+        return compute_pressure_jcz3(n_64, v, t, coeffs_low, coeffs_high, *eos_params, mw_g_per_mol)
     
     def u_func(r, t):
         v = mw_g_per_mol / (r + 1e-10)
-        return compute_internal_energy_jcz3(n_64, v, t, coeffs_all, *eos_params, mw_g_per_mol)
+        return compute_internal_energy_jcz3(n_64, v, t, coeffs_low, coeffs_high, *eos_params, mw_g_per_mol)
 
     # 1. 计算偏导数
     dP_drho, dP_dT = jax.grad(p_func, argnums=(0, 1))(rho_64, T_64)
@@ -108,13 +106,13 @@ def get_sound_speed(rho, T, n, atom_vec, coeffs_all, eos_params, atomic_masses):
     return to_fp32(jnp.sqrt(jnp.maximum(a2, 1e-6)))
 
 @jit
-def get_internal_energy_pt(rho, T, atom_vec, coeffs_all, A_matrix, atomic_masses, eos_params):
+def get_internal_energy_pt(rho, T, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params):
     rho_64 = to_fp64(rho)
     T_64 = to_fp64(T)
     mw_g_per_mol = jnp.dot(atom_vec, atomic_masses)
     V_molar = mw_g_per_mol / (rho_64 + 1e-10)
     
-    n_eq = solve_equilibrium(atom_vec, V_molar, T_64, A_matrix, coeffs_all, eos_params)
-    u_mol = compute_internal_energy_jcz3(n_eq, V_molar, T_64, coeffs_all, *eos_params, mw_g_per_mol)
+    n_eq = solve_equilibrium(atom_vec, V_molar, T_64, A_matrix, coeffs_low, coeffs_high, eos_params)
+    u_mol = compute_internal_energy_jcz3(n_eq, V_molar, T_64, coeffs_low, coeffs_high, *eos_params, mw_g_per_mol)
     
     return to_fp32(u_mol / (mw_g_per_mol / 1000.0))

@@ -39,21 +39,31 @@ def calibrate_hmx():
         alpha.append(p.get('alpha', 13.0))
         lam.append(p.get('lambda_ree', 0.0))
     
+    # V11 Phase 4: Correct Solid Mask for C_graphite (idx 4)
+    solid_mask = jnp.array([0., 0., 0., 0., 1., 0., 0.])
+    solid_v0_vec = jnp.array([0., 0., 0., 0., 5.3, 0., 0.]) # cm3/mol
+    
     eos_params = (jnp.array(eps), jnp.array(r), jnp.array(alpha), jnp.array(lam),
-                  jnp.zeros(len(SPECIES_LIST)), jnp.zeros(len(SPECIES_LIST)), 
+                  solid_mask, solid_v0_vec, 
                   0.0, 10.0, 0.0, 0.0) # r_star_rho_corr = 0.0
     
     products_db = load_products()
-    coeff_list = []
+    coeff_list_low = []
+    coeff_list_high = []
     for s in SPECIES_LIST:
         p = products_db[s]
-        c7 = p.coeffs_high[:7]
-        coeff_list.append(jnp.concatenate([jnp.zeros(2), c7]))
-    coeffs_all = jnp.stack(coeff_list)
+        # Pad NASA-7 to length 9
+        cl = p.coeffs_low[:7]
+        ch = p.coeffs_high[:7]
+        coeff_list_low.append(jnp.concatenate([jnp.zeros(2), cl]))
+        coeff_list_high.append(jnp.concatenate([jnp.zeros(2), ch]))
+    
+    coeffs_low = jnp.stack(coeff_list_low)
+    coeffs_high = jnp.stack(coeff_list_high)
     
     # HMX: C4H8N8O8
     atom_vec = jnp.array([4.0, 8.0, 8.0, 8.0, 0.0])
-    eos_data = (atom_vec, coeffs_all, A_matrix, atomic_masses, eos_params)
+    eos_data = (atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params)
     
     # 理论反应热与初始能量 (J/kg)
     # HMX 形成焓 Hf = 75 kJ/mol. Mw = 0.29616 kg/mol.
@@ -68,7 +78,8 @@ def calibrate_hmx():
     
     # 检查 VN 点声速
     p_vn, n_vn = get_thermo_properties(rho_vn, T_vn, *eos_data)
-    a_vn = get_sound_speed(rho_vn, T_vn, n_vn, eos_data[0], eos_data[1], eos_data[4], eos_data[3])
+    # Correct unpack: atom_vec, cl, ch, A, masses, params = eos_data
+    a_vn = get_sound_speed(rho_vn, T_vn, n_vn, eos_data[0], eos_data[1], eos_data[2], eos_data[5], eos_data[4])
     M_vn = u_vn / a_vn
     print(f"VN Spike: rho={rho_vn:.3f}, u={u_vn:.1f}, T={T_vn:.0f} K, a={a_vn:.1f}, M={M_vn:.3f}")
     
