@@ -10,13 +10,14 @@
 
 **PyDetonation-Ultra (PDU)** is a high-fidelity, differentiable physics engine designed for simulating detonation performance and calibrating Equation of State (EOS) parameters for explosives. Built on **JAX**, it leverages automatic differentiation to enable gradient-based optimization for parameter fitting and physics calibration.
 
-The project is currently in the **V10.6 "Constrained Physics"** phase, focusing on physical consistency and engineering compatibility of JWL parameters, and is transitioning towards **V11 Multi-Phase Dynamics**.
+The project is currently in the **V11.0 "Multi-Phase Dynamics"** phase, focusing on high-fidelity reactive flow ODEs and unified material calibration.
 
 ### Core Technologies
 *   **Language:** Python 3.9+
 *   **Framework:** JAX (with `jax_enable_x64` strictly enabled)
+*   **Acceleration:** GPU-accelerated (RTX 4060 compatible)
 *   **Optimization:** JAX-PSO + Nelder-Mead (Dual-Refinement)
-*   **Physics:** JCZ3 EOS (with Ree-Ross Polar Correction), Miller-PDU Kinetics (V5), Constrained JWL Fitting
+*   **Physics:** JCZ3 EOS (with Ree-Ross Polar Correction), Miller-PDU V5, High-T Endotherm (Scheme A')
 
 ## Development Environment
 
@@ -29,32 +30,37 @@ The project adheres to strict environmental isolation using Conda.
 ### Directory Structure
 ```
 /home/jcl/HDY/PyDetonation-Ultra/
-├── pdu/                    # Core source code (Forward-Only Focus)
-│   ├── api.py              # Global Quenching & Heat Sink Logic
+├── pdu/                    # Core source code
+│   ├── api.py              # Global Quenching & ZND Entry
 │   ├── core/               # Equilibrium solvers (Schur-RAND)
 │   ├── physics/            # Physics modules (EOS, Kinetics, JWL)
-│   ├── calibration/        # PSO-based Parameter Fitting
-│   └── tests/              # Benchmark suites
-├── docs/                   # Documentation & Whitepapers
-│   ├── project_whitepaper.md # Latest V10.6 validation results
-│   ├── 反馈意见.md           # Critical audit feedback
-│   └── 两相流转型咨询需求书.md # V11 Roadmap
+│   ├── solver/             # ZND & Stability Framework
+│   └── tests/              # Benchmark & Consistency suites
+├── documents/               # Reports & Technical Logs
+│   ├── dev_log.md          # Project milestones
+│   └── 技术反馈落实情况报告_v3.md # Latest engineering validation
 └── RULES.md                # Authoritative guide
 ```
 
 ## Key Workflows & Commands
 
-### 1. Benchmark & Validation
+### 1. Thermodynamic Consistency (V11 Mandatory)
 ```bash
-# Current active benchmark (V10.6 compatible)
-PYTHONPATH=. python pdu/tests/test_v10_5_benchmark.py
+# Verify Cv positivity, derivative consistency, and Ideal Gas limit
+PYTHONPATH=. python pdu/tests/test_thermo_consistency.py
 ```
 
-### 2. V10.6 Physics Mandates (Crucial)
-*   **Matrix Quenching:** Energetic matrix must have quenching factors (~0.97) when metals are present.
-*   **JWL Barriers:** $\omega 
-[0.25, 0.45]$ and $B/A < 0.1$ are mandatory to avoid numerical toxins.
-*   **Energy Consistency:** JWL $E_0$ must match the effective mechanical work (Gurney Energy), typically $0.72 \times Q_{theoretical}$ for Al-explosives.
+### 2. HMX Calibration Landing
+```bash
+# Execute full HMX calibration and ZND profiling
+PYTHONPATH=. python pdu/tests/calibrate_hmx_v11.py
+```
+
+### 3. Core Physics Mandates (V11 Compliance)
+*   **Matrix Quenching:** Matrix efficiency factor (~0.97) for metal-filled systems.
+*   **JWL Barriers:** $\omega \in [0.25, 0.45]$ and $B/A < 0.1$ for engineering compatibility.
+*   **Triple Output:** Cv diagnostics must include total(J/K), mass(J/kg/K), and molar(J/mol/K).
+*   **A-Anchoring:** Energy corrections must be zero-anchored at $T_{ref}=298.15\text{K}$.
 
 ## Current Development Focus (V11.0 Phase 6)
 
