@@ -63,4 +63,7 @@ PYTHONPATH=. python pdu/tests/test_v10_5_benchmark.py
     *   **HMX Success**: Resolved the 8600K temperature anomaly. New landing: $T_{CJ}=4545$ K, $P_{CJ}=38.9$ GPa using Scheme A' ($u_{inf}=4.0$ MJ/kg).
     *   **Numerical Hardening**: Integrated Patch A-H (Smoothing+Endotherm). Solver is now robust against NaN and Sonic instabilities.
     *   **Engineering Compliance**: Standardized "Triple Output" for heat capacity and updated NASA-9 high-accuracy coefficients for H₂/O₂/C.
-*   **Next Phase:** Batch calibration for RDX/PETN/TNT and Transition to Multi-Phase Dynamics (Eulerian-Lagrangian).
+*   **Next Phase:** 
+    1.  **HMX Closure**: Final landing of all base detonation and JWL EOS parameters.
+    2.  **Single Explosive Expansion**: Batch calibration for standard species (RDX, PETN, TNT, etc.) to build a validated material library.
+    3.  **Multi-Phase/Composite Dynamics**: Transition to Eulerian-Lagrangian simulations for aluminized and binder-based explosives.
