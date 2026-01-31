@@ -462,6 +462,42 @@ def project_state_to_conservation(n, V_guess, T_guess,
     # Return solution and convergence flag
     return V_f, T_f, rho_f, conv_f
 
+# V11 Tier 2: JIT-compiled Kernel for Projection Step
+@jax.jit
+def znd_projection_step_kernel(V_curr, T_curr, n_curr, lam_target, constants, eos_data):
+    """
+    Single Step Kernel: Projects state to new lambda target.
+    Returns: (V_new, T_new, rho_new, n_new, u_new, P_new, a_new, M_new, conv_flag)
+    """
+    J, Pi, E_total, q_reaction = constants
+    atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params = eos_data
+    
+    # A. Target Energy
+    E_prod_target = E_total - (1.0 - lam_target) * q_reaction
+    
+    # B. Project (Predictor)
+    V_pred, T_pred, rho_pred, conv = project_state_to_conservation(
+        n_curr, V_curr, T_curr, J, Pi, E_prod_target, eos_data
+    )
+    
+    # C. Update Composition
+    P_tmp, n_new = get_thermo_properties(rho_pred, T_pred, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params, n_init=n_curr)
+    
+    # D. Project (Corrector)
+    V_final, T_final, rho_final, conv_final = project_state_to_conservation(
+        n_new, V_pred, T_pred, J, Pi, E_prod_target, eos_data
+    )
+    
+    # Derived Properties
+    u_final = J / rho_final
+    P_final = Pi - J**2 / rho_final
+    a_final = get_sound_speed(rho_final, T_final, n_new, atom_vec, coeffs_low, coeffs_high, eos_params, atomic_masses)
+    M_final = u_final / a_final
+    
+    overall_conv = conv & conv_final
+    
+    return V_final, T_final, rho_final, n_new, u_final, P_final, a_final, M_final, overall_conv
+
 def solve_znd_projection(D, init_state, x_span, eos_data, drag_model, heat_model, q_reaction, n_steps=500):
     """
     V11 Patch E: Chemical Explicit + Thermodynamic Projection
@@ -520,142 +556,130 @@ def solve_znd_projection(D, init_state, x_span, eos_data, drag_model, heat_model
     
     
     E_total = e_vn + P_vn_pa/(rho_vn * 1000.0) + 0.5 * u_vn**2 + (1.0 - lam_0) * q_reaction
-    
-    print(f"ZND Projection Start: D={D}, P_vn={P_vn_pa/1e9:.2f} GPa, T_vn={T_vn:.0f} K, E_tot={E_total:.2e}")
-
-    # 2. Stepping Loop
-    # We step lambda from 0 to 1
-    lam_seq = jnp.linspace(0.0, 0.99, n_steps) # Avoid 1.0 singularity
+    # 2. Stepping Loop (Dynamic Python Loop with Reject/Shrink)
     
     history = {
         'rho': [], 'u': [], 'T': [], 'lam': [], 'x': [], 
         'P': [], 'a': [], 'M': [], 'sw_det': []
     }
     
-    # Init vars
-    V_curr = V_vn
-    T_curr = T_vn
-    n_curr = n_vn
-    x_curr = 0.0
-    t_curr = 0.0
-    
-    # Store step 0
+    # Init storage
     a_vn_val = get_sound_speed(rho_vn, T_vn, n_vn, atom_vec, coeffs_low, coeffs_high, eos_params, atomic_masses)
+    
+    curr_state_pack = (V_vn, T_vn, n_vn, 0.0, 0.0) # V, T, n, x, t
+    
+    # Store initial
     history['rho'].append(rho_vn)
     history['u'].append(u_vn)
     history['T'].append(T_vn)
-    history['lam'].append(lam_0)
+    history['lam'].append(0.0)
     history['x'].append(0.0)
     history['P'].append(P_vn_pa)
     history['a'].append(a_vn_val)
     history['M'].append(u_vn/a_vn_val)
-    history['sw_det'].append(1.0) # Dummy det
+    
+    constants = (J, Pi, E_total, q_reaction)
 
-    for i in range(1, n_steps):
-        lam = lam_seq[i]
-        dlam = lam - lam_seq[i-1]
+    print(f"ZND Projection Start: D={D}, P_vn={P_vn_pa/1e9:.2f} GPa, T_vn={T_vn:.0f} K, E_tot={E_total:.2e}")
+
+    lam_curr = 0.0
+    dlam = 1.0 / n_steps # Initial step size
+    step_count = 0
+    max_steps = n_steps * 10 # Safety limit
+    
+    while lam_curr < 0.99 and step_count < max_steps:
+        step_count += 1
+        lam_target = lam_curr + dlam
+        if lam_target > 0.995: # Cap at 0.995
+             lam_target = 0.995
+             dlam = lam_target - lam_curr
         
-        # A. Target Energy for Product EOS
-        # E_prod_target = E_total - (1-lam)*Q
-        E_prod_target = E_total - (1.0 - lam) * q_reaction
+        V_c, T_c, n_c, x_c, t_c = curr_state_pack
         
-        # B. Composition Guess
-        # Use previous n_curr as guess for Projection
-        # (Assuming composition changes slowly or is frozen for the step)
-        
-        # C. Project (V, T)
-        # Solve R1, R2 for V, T
-        V_new, T_new, rho_new, conv = project_state_to_conservation(
-            n_curr, V_curr, T_curr,
-            J, Pi, E_prod_target,
-            eos_data
+        # Call JIT Kernel
+        # We pass lam_target
+        V_new, T_new, rho_new, n_new, u_new, P_new, a_new, M_new, conv = znd_projection_step_kernel(
+            V_c, T_c, n_c, lam_target, constants, eos_data
         )
+        
+        # Reject Logic
+        reject = False
+        reject_reason = ""
         
         if not conv:
-            print(f"Step {i} (lam={lam:.3f}): Projection Failed. Stopping.")
+            reject = True
+            reject_reason = "Convergence Failed"
+        elif P_new < 0:
+            reject = True
+            reject_reason = f"Negative Pressure ({P_new/1e9:.3f} GPa)"
+        elif T_new < 50:
+             reject = True
+             reject_reason = f"Low Temperature ({T_new:.1f} K)"
+        elif jnp.isnan(rho_new):
+             reject = True
+             reject_reason = "NaN Density"
+        if reject:
+            if dlam < 1e-6:
+                print(f"Step {step_count}: Reject ({reject_reason}). dlam too small. Stopping.")
+                break
+            # Shrink
+            dlam *= 0.5
+            # print(f"Step {step_count}: Reject ({reject_reason}). Shrinking dlam -> {dlam:.2e}")
+            continue # Retry loop with same lam_curr, new dlam
+
+        # Calculate Space/Time integration (Post-Facto)
+        P_gpa = P_new / 1e9
+        rate = 1000.0 * (max(float(P_gpa), 0.0)**2.0) * (1.0 - lam_target) 
+        rate = max(rate, 1e-10)
+        dt = dlam / rate
+        dx = u_new * dt
+        
+        x_new = x_c + dx
+        t_new = t_c + dt
+
+        # Sonic Check (Accept but Stop)
+        sonic_stop = False
+        if abs(1.0 - M_new) < 1e-3:
+             print(f"Sonic Point Reached at lam={lam_target:.3f}, M={M_new:.3f}. Stopping.")
+             sonic_stop = True
+
+        # Accept Step
+        lam_curr = lam_target
+        curr_state_pack = (V_new, T_new, n_new, x_new, t_new) # Use x_new safely here
+
+        # Store
+        history['rho'].append(rho_new)
+        history['u'].append(u_new)
+        history['T'].append(T_new)
+        history['lam'].append(lam_curr)
+        history['x'].append(x_new)
+        history['P'].append(P_new)
+        history['a'].append(a_new)
+        history['M'].append(M_new)
+        
+        if sonic_stop:
             break
             
-        # D. Update Composition (Equilibrium at new V, T)
-        # PDU assumption: Gas is always in local equilibrium (or partial equilibrium)
-        P_tmp, n_new = get_thermo_properties(rho_new, T_new, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params, n_init=n_curr)
-        
-        # Optional: Re-Project with new n? (Corrector)
-        # For precision, yes.
-        V_final, T_final, rho_final, conv_final = project_state_to_conservation(
-            n_new, V_new, T_new,
-            J, Pi, E_prod_target,
-            eos_data
-        )
-        
-        if not conv_final:
-             print(f"Step {i}: Corrector Failed.")
-             break
-        
-        # Update state
-        V_curr = V_final
-        T_curr = T_final
-        n_curr = n_new
-        rho_curr = rho_final
-        u_curr = J / rho_curr
-        P_curr = Pi - J**2 / rho_curr # Consistent P from Momentum
-        
-        # E. Integrate Space/Time
-        # Rate Calculation
-        P_gpa = P_curr / 1e9
-        k_p = 1000.0 # Consistent with older code
-        n_p = 2.0
-        rate = k_p * (jnp.maximum(P_gpa, 0.0)**n_p) * (1.0 - lam)
-        rate = jnp.maximum(rate, 1e-10) # Avoid div zero
-        
-        dt = dlam / rate
-        dx = u_curr * dt
-        
-        x_curr += dx
-        t_curr += dt
-        
-        # F. Sonic Check (Patch E3)
-        # Verify if we hit CJ
-        a_curr = get_sound_speed(rho_curr, T_curr, n_curr, atom_vec, coeffs_low, coeffs_high, eos_params, atomic_masses)
-        M_curr = u_curr / a_curr
-        
-        sonic_crit = 1.0 - M_curr
-        
-        # Store
-        history['rho'].append(rho_curr)
-        history['u'].append(u_curr)
-        history['T'].append(T_curr)
-        history['lam'].append(lam)
-        history['x'].append(x_curr)
-        history['P'].append(P_curr)
-        history['a'].append(a_curr)
-        history['M'].append(M_curr)
-        history['sw_det'].append(0.0) # placeholder
-
-        if jnp.abs(sonic_crit) < 1e-3:
-            print(f"Sonic Point Reached at lam={lam:.3f}, M={M_curr:.4f}. Stopping.")
-            break
-        
-        if M_curr > 1.02: # Overshoot check (if we jumped to Weak solution?)
-            # Usually Strong solution starts M < 1 and goes to M=1.
-            # If M > 1, we might have crossed CJ.
-            print(f"Supersonic flow detected (M={M_curr:.3f}). Stopping.")
-            break
+        # Grow step slightly (aggressive)
+        if step_count % 5 == 0:
+            dlam = min(dlam * 1.1, 0.01)
 
     # Pack Solution
     class Sol:
         pass
     sol = Sol()
-    # Convert to jnp arrays
-    for k, v in history.items():
-        setattr(sol, k, jnp.array(v))
-        
-    sol.gas = GasState(
-        rho=sol.rho,
-        u=sol.u,
-        T=sol.T,
-        lam=sol.lam
-    )
-    # Fake ys for compatibility if need be
+    
+    # Convert lists to arrays
+    sol.rho = jnp.array(history['rho'])
+    sol.u = jnp.array(history['u'])
+    sol.T = jnp.array(history['T'])
+    sol.lam = jnp.array(history['lam'])
+    sol.x = jnp.array(history['x'])
+    sol.P = jnp.array(history['P'])
+    sol.a = jnp.array(history['a'])
+    sol.M = jnp.array(history['M'])
+    
+    sol.gas = GasState(rho=sol.rho, u=sol.u, T=sol.T, lam=sol.lam)
     return sol
 
 # Alias to replace old solver

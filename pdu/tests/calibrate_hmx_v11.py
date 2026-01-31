@@ -13,6 +13,11 @@ from pdu.core.equilibrium import build_stoichiometry_matrix
 import json
 from pathlib import Path
 
+# V11 Phase 6: JWL Fitting Imports
+from pdu.thermo.isentrope import generate_isentrope
+from pdu.physics.jwl import fit_jwl_from_isentrope, jwl_pressure
+from pdu.utils.precision import to_fp64
+
 def calibrate_hmx():
     print("=== HMX Calibration (V11.0 Differentiable Core) ===")
     
@@ -35,7 +40,9 @@ def calibrate_hmx():
     for s in SPECIES_LIST:
         p = v7_params[s]
         eps.append(p.get('epsilon_over_k', 100.0))
-        r.append(3.1) # FORCE 3.1 (Override JSON to fix 992 GPa overpacking)
+        base_r = p.get('r_star', 3.5)
+        # V11 Refinement: Use moderate scaling around 0.84 to balance repulsion and T
+        r.append(base_r * 0.845) 
         alpha.append(p.get('alpha', 13.0))
         lam.append(p.get('lambda_ree', 0.0))
     
@@ -68,7 +75,7 @@ def calibrate_hmx():
     # 理论反应热与初始能量 (J/kg)
     # HMX 形成焓 Hf = 75 kJ/mol. Mw = 0.29616 kg/mol.
     e0 = 75000.0 / 0.29616
-    q_reaction = 5.8e6 
+    q_reaction = 5.8e6 * 0.76 # Effective detonation heat (Gurney consistent)
     
     # 3. 初始猜测 D
     D_var = jnp.array(D_exp) 
@@ -119,6 +126,89 @@ def calibrate_hmx():
     # 计算误差
     p_err = (P_f/1e9 - P_exp) / P_exp
     print(f"Pressure Error: {p_err*100:.1f}%")
+    
+    # =========================================================================
+    # V11 Phase 6: JWL Fitting (Automated)
+    # =========================================================================
+    if abs(p_err) < 0.15: # Only fit if result is reasonable
+        print("\n=== Generating Isentrope for JWL Fitting ===")
+        # 1. Generate Isentrope Data (V_cj to 10*V_cj)
+        # We need V relative to V0 (rho0=1.891) for JWL standard.
+        # V0 = 1/rho0. 
+        # V_cj = 1/rho_f.
+        # V_rel_start = V_cj / (1.0/rho0) = rho0 / rho_f
+        
+        # Calculate Isentrope using new solver
+        # Note: generate_isentrope returns arrays of P(Pa), T(K) for RELATIVE volumes V/V_cj
+        # wait, generate_isentrope implementation assumes V_array input is absolute?
+        # Let's check isentrope.py signature again.
+        # It takes V_max_rel scalar. It generates V_array internally.
+        # And returns V, P, T.
+        
+        # Re-check generate_isentrope input:
+        # V_array = V_cj * V_factors (where factors 1.0 -> v_max_rel)
+        # So return V_array is absolute volume (m3 for the recipe unit).
+        
+        V_abs, P_isen, T_isen = generate_isentrope(
+             rho_f, T_f, atom_vec, coeffs_low, coeffs_high, A_matrix, atomic_masses, eos_params,
+             v_max_rel=10.0, n_points=25
+        )
+        
+        # Convert to JWL relative volume: V_jwl = v / v0
+        # v0 (specific volume) = 1/rho0
+        # v (specific volume) = V_abs / m_kg
+        
+        # Alternatively: V_jwl = V_abs / V_abs_0
+        # where V_abs_0 = m_kg / rho0
+        # This is ratio-consistent.
+        
+        am_kg = jnp.where(jnp.max(atomic_masses)>0.5, atomic_masses*1e-3, atomic_masses)
+        m_kg = jnp.dot(atom_vec, am_kg)
+        V_abs_0 = m_kg / (rho0 * 1000.0) # m3
+        
+        V_rel_jwl = V_abs / V_abs_0
+        P_gpa = P_isen / 1e9
+        
+        print(f"Isentrope Generated: {len(P_gpa)} points. Range V_rel [{V_rel_jwl[0]:.2f}, {V_rel_jwl[-1]:.2f}]")
+        print(f"P range: {P_gpa[0]:.2f} -> {P_gpa[-1]:.4f} GPa")
+        
+        # 2. Fit JWL
+        print("\n=== Fitting JWL Parameters ===")
+        # E0 in GPa (Energy per unit volume). 
+        # e0 is J/kg. rho0 is g/cm3 -> 1891 kg/m3.
+        # E0 = e0 * rho0_si = (J/kg) * (kg/m3) = J/m3 = Pa. /1e9 -> GPa.
+        
+        # e0 calculated above: 75000 / 0.296 = 2.5e5 J/kg? No.
+        # HMX Hf=75 kJ/mol. Mw=0.296 kg/mol.
+        # e0 = 75000 / 0.296 = 253378 J/kg.
+        # Wait, heat of detonation is ~5-6 MJ/kg. e0 (internal energy of formation) is smaller.
+        # But JWL E0 is "Total Energy available for expansion work".
+        # It is usually (e_init - e_products_at_ref)?
+        # Or often user supplied?
+        # Let's use the provided q_reaction for estimating E0 initially, or e0 * rho0.
+        # The fitter manual says "E0 (GPa) initial energy density".
+        # Typically for HMX E0 ~ 9-10 GPa.
+        # q_reaction = 5.8e6 J/kg. 
+        # E0 ~ 5.8e6 * 1891 ~ 1.1e10 Pa = 11 GPa.
+        
+        E0_gpa = (q_reaction * rho0 * 1000.0) / 1e9
+        
+        jwl = fit_jwl_from_isentrope(
+            V_rel_jwl, P_gpa, rho0, E0_gpa, D_exp, P_f/1e9,
+            method='RELAXED_PENALTY'
+        )
+        
+        print("\n=== Final JWL Calibration Results ===")
+        print(f"A = {jwl.A:.4f}")
+        print(f"B = {jwl.B:.4f}")
+        print(f"R1 = {jwl.R1:.4f}")
+        print(f"R2 = {jwl.R2:.4f}")
+        print(f"omega = {jwl.omega:.4f}")
+        print(f"E0 = {jwl.E0:.4f}")
+        print(f"MSE (Log) = {jwl.fit_mse:.6e}")
+        
+    else:
+        print("\nSkipping JWL Fitting: P_CJ error too high.")
 
 if __name__ == "__main__":
     calibrate_hmx()

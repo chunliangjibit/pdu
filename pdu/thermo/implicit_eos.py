@@ -116,13 +116,18 @@ def get_thermo_properties(rho, T, atom_vec, coeffs_low, coeffs_high, A_matrix, a
         )
 
     # Use compute_total_helmholtz_energy to get consistent pressure P = -dA/dV
+    # Use compute_total_helmholtz_energy to get consistent pressure P = -dA/dV
+    # Expert V11 Fix: Must use scalar total volume and scalar average MW
+    V_total_cm3_scalar = V_total_m3 * 1e6
+    mw_avg_g_scalar = mw_avg_kg * 1000.0
+    
     P_pa = compute_pressure_jcz3(
-        n_final, V_molar, T_64, coeffs_low, coeffs_high,
+        n_final, V_total_cm3_scalar, T_64, coeffs_low, coeffs_high,
         eos_params[0], eos_params[1], eos_params[2], eos_params[3],
         eos_params[4], eos_params[5], 
         eos_params[6], eos_params[7], eos_params[8],
         eos_params[9],
-        mw_g_per_mol # Ensure this is g/mol
+        mw_avg_g_scalar # Ensure this is scalar g/mol
     )
     
     return to_fp32(P_pa), to_fp32(n_final)

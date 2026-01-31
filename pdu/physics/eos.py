@@ -110,10 +110,16 @@ _get_thermo_vec = jax.vmap(_get_thermo_single, in_axes=(0, 0, None))
 def compute_effective_diameter_ratio(T, epsilon, alpha):
     """Calculate d/r* ratio based on Temperature"""
     alpha_minus_6 = alpha - 6.0
-    T_star = jnp.maximum(T / (epsilon + 1e-10), 1e-10)
-    term = (alpha_minus_6 / 6.0) * T_star
+    # Patch E2: Clamp T for diameter model (Low Temp Protection)
+    T_safe = smooth_floor(T, 100.0, 10.0)
+    # Patch E3: Guard against zero epsilon/alpha (NaN gradient prevention)
+    eps_safe = jnp.maximum(epsilon, 1.0)
+    alpha_safe = jnp.maximum(alpha, 1.0)
+    T_star = T_safe / eps_safe
+    term = ((alpha_safe - 6.0) / 6.0) * T_star
     log_term = jnp.log(jnp.maximum(term, 1e-10))
-    ratio = 1.0 - (1.0 / alpha) * log_term
+    ratio_raw = 1.0 - (1.0 / alpha_safe) * log_term
+    ratio = jnp.where(epsilon > 0.1, ratio_raw, 1.0)
     
     # Patch A: Smooth Clip for diameter ratio
     ratio = smooth_floor(ratio, 0.4, 0.02)
@@ -131,7 +137,7 @@ def compute_mixed_matrices_dynamic(T, eps_vec, r_vec, alpha_vec, lambda_vec):
     """Calculate mixing matrices"""
     T_safe = jnp.maximum(T, 1e-2)
     eps_T = eps_vec * (1.0 + lambda_vec / T_safe)
-    eps_matrix = jnp.sqrt(jnp.outer(eps_T, eps_T))
+    eps_matrix = jnp.sqrt(jnp.outer(eps_T, eps_T) + 1e-18)
     r_matrix = 0.5 * (jnp.expand_dims(r_vec, 1) + jnp.expand_dims(r_vec, 0))
     alpha_matrix = 0.5 * (jnp.expand_dims(alpha_vec, 1) + jnp.expand_dims(alpha_vec, 0))
     return eps_matrix, r_matrix, alpha_matrix
@@ -139,7 +145,7 @@ def compute_mixed_matrices_dynamic(T, eps_vec, r_vec, alpha_vec, lambda_vec):
 @jax.jit
 def compute_solid_volume_murnaghan(solid_v0, P_est, is_carbon, is_alumina):
     """凝聚相 Murnaghan EOS"""
-    v0_c_target = 4.44 
+    v0_c_target = 5.33 # Graphite density (V11 Fix)
     c_compress = jnp.power(1.0 + 6.0 * P_est / 60e9, -1.0/6.0)
     vol_c = v0_c_target * c_compress
     al_compress = jnp.power(1.0 + 4.0 * P_est / 150e9, -1.0/4.0)
@@ -186,12 +192,9 @@ def compute_total_helmholtz_energy(
     
     n_solid, n_gas = n * solid_mask, n * (1.0 - solid_mask)
     n_gas_total = jnp.sum(n_gas) + 1e-30
-    n_gas_total = jnp.sum(n_gas) + 1e-30
     # jax.debug.print("rho={r}, n_gas_total={ngt}", r=rho_macro, ngt=n_gas_total)
     
-    P_proxy = (n_gas_total * 8.314 * T) / (V_total * 0.6 * 1e-6)
-    
-    P_proxy = (n_gas_total * 8.314 * T) / (V_total * 0.6 * 1e-6) 
+    P_proxy = (n_gas_total * 8.314 * T) / (V_total * 0.15 * 1e-6)
     P_proxy = jnp.maximum(P_proxy, 1e5)
     is_carbon = (solid_v0 > 5.0) & (solid_v0 < 6.0)
     is_alumina = (solid_v0 > 24.0) & (solid_v0 < 27.0)
@@ -227,11 +230,12 @@ def compute_total_helmholtz_energy(
     f_cs = (4.0 * eta_cs - 3.0 * eta_cs * eta_cs) / (one_minus * one_minus)
     A_cs = n_gas_total * R * T * f_cs
     
-    # Barrier 部分: 对 overshoot 进行惩罚
-    OVER_W = 0.02
-    over = jax.nn.softplus((eta_raw - ETA_CAP) / OVER_W) * OVER_W
-    K_ETA = 100.0
-    A_bar = n_gas_total * R * T * K_ETA * (over / OVER_W) ** 2
+    # Cold Repulsion Barrier for Overlap (V11 Patch G)
+    # Target: At eta=1.1, P_rep should be ~50 GPa, and U_rep should be ~10 kJ/g.
+    # We use a static term that doesn't vanish at 0K.
+    A_bar_cold = 1e6 * n_gas_total * jax.nn.softplus((eta_raw - ETA_CAP) / 0.05)**2
+    A_bar_thermal = 1.0 * n_gas_total * R * T * jax.nn.softplus((eta_raw - ETA_CAP) / 0.05)
+    A_bar = A_bar_cold + A_bar_thermal
     
     A_excess_hs = A_cs + A_bar
     A_excess_hs = A_cs + A_bar
@@ -249,8 +253,14 @@ def compute_total_helmholtz_energy(
     A_solid_fixed = n_fixed_solids * (e_fixed_solids + cv_al_eff * (T - 298.0) - T * (28.3 + cv_al_eff * jnp.log(jnp.maximum(T / 298.0, 1e-3))))
     
     A_val = A_gas_total + A_solid_eq + A_solid_fixed
-    A_val = A_gas_total + A_solid_eq + A_solid_fixed
-    # jax.debug.print("A_final={a}, A_rep={rep}", a=A_val, rep=A_rep)
+    
+    # Debug trace
+    # jax.debug.print("n_gas_total: {ngt}", ngt=n_gas_total)
+    # jax.debug.print("V_gas_eff: {vge}", vge=V_gas_eff)
+    # jax.debug.print("A_gas_id: {ai}, A_hs: {ah}, U_attr: {ua}, A_s_eq: {ase}, A_s_fix: {asf}",
+    #                ai=A_gas_ideal, ah=A_excess_hs, ua=U_attr, ase=A_solid_eq, asf=A_solid_fixed)
+    # jax.debug.print("Diag: eta={e:.4f}, P_est={p:.1f} GPa", e=eta_raw, p=P_proxy/1e9)
+
     return A_val
     return A_val
 
