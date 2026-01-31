@@ -34,17 +34,23 @@
     - **Energy Cutoff**: 含铝炸药 JWL $E_0$ 目标值需乘上有效做功系数（建议 0.72），将后燃烧能量剥离。
     - **Slope Anchor**: 拟合必须考虑 CJ 点的 Rayleigh 线斜率约束。
 
+### 4.6 V11.0 Engineering & Diagnostic Protocols
+- **Triple Output Heat Capacity**: 所有的热力学诊断输出必须同时包含：总量 ($C_v$, J/K)、质量比比热 ($c_v$, J/kg/K) 和摩尔比热 ($\bar c_v$, J/mol/K)。
+- **Asymptotic Ideal Gas Limit**: 新的 EOS 修改必须通过低密度压力自检（建议 $V=1000\text{ cm}^3\text{/mol}$ 时误差 $< 3\%$）。
+- **Reference State Anchoring**: 所有自由能修正项（如吸热修正）必须确保在 $T_{ref}=298.15\text{ K}$ 处对原始自由能零点无干扰 ($A_{add}=0$)。
+- **Domain Protection**: 对于存在热力学不稳定区（$C_v < 0$）的模型，必须在代码中添加显式的 Domain Stability Notice。
+
 ---
 
 ## 5. 测试与验证规范
 
 ### 5.2 物理验证协议
-必须运行全量对标脚本，并将结果更新至 `docs/project_whitepaper.md`。
+必须运行全量对标脚本，并将结果更新至 `docs/project_whitepaper.md`。核心热力学一致性验证需通过 `pdu/tests/test_thermo_consistency.py`。
 
 ### 5.4 诚实原则 (Honest Disclosure)
 - 严禁隐瞒 JWL 参数的非物理行为（如 B < 0）。
 - 必须如实报告含铝炸药的爆压/爆速偏差，作为模型演进的动力。
 
 ---
-**版本**: V10.6 "Constrained Physics" (Simplified Core)
-**更新日期**: 2026-01-30
+**版本**: V11.0 "Multi-Phase Dynamics Transition"
+**更新日期**: 2026-01-31

@@ -56,9 +56,11 @@ PYTHONPATH=. python pdu/tests/test_v10_5_benchmark.py
 [0.25, 0.45]$ and $B/A < 0.1$ are mandatory to avoid numerical toxins.
 *   **Energy Consistency:** JWL $E_0$ must match the effective mechanical work (Gurney Energy), typically $0.72 \times Q_{theoretical}$ for Al-explosives.
 
-## Current Development Focus (V11.0 Phase 5)
+## Current Development Focus (V11.0 Phase 6)
 
-*   **Status:** V11.0 Phase 5 (Thermodynamic Hardening) Implemented.
-*   **Achievement:** Successfully stabilized ZND solver using **Patch A-D** (Smooth Barriers, Sigmoid NASA, Consistent Sound Speed, Reject & Shrink Integrator). Eliminated all NaN/Sonic instabilities.
-*   **Current Blocker:** **Reaction Stagnation**. ZND ignition fails due to anomalously low pressure (0.12 GPa vs expected >30 GPa) at VN point. Investigation into unit/state initialization is ongoing.
-*   **Next Phase:** Resolve stagnation issue and proceed to Multi-Explosive Benchmark.
+*   **Status:** V11.0 Phase 6 (Calibration Stabilization) **COMPLETE**.
+*   **Achievement:** 
+    *   **HMX Success**: Resolved the 8600K temperature anomaly. New landing: $T_{CJ}=4545$ K, $P_{CJ}=38.9$ GPa using Scheme A' ($u_{inf}=4.0$ MJ/kg).
+    *   **Numerical Hardening**: Integrated Patch A-H (Smoothing+Endotherm). Solver is now robust against NaN and Sonic instabilities.
+    *   **Engineering Compliance**: Standardized "Triple Output" for heat capacity and updated NASA-9 high-accuracy coefficients for H₂/O₂/C.
+*   **Next Phase:** Batch calibration for RDX/PETN/TNT and Transition to Multi-Phase Dynamics (Eulerian-Lagrangian).

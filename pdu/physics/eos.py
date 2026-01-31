@@ -254,6 +254,50 @@ def compute_total_helmholtz_energy(
     
     A_val = A_gas_total + A_solid_eq + A_solid_fixed
     
+    # =========================================================================
+    # V11 Patch H: High-Temperature Endotherm (Scheme A')
+    # 
+    # Adds a T-only Helmholtz term to simulate dissociation latent heat.
+    # Key properties:
+    #   - Does NOT affect pressure (P = -dA/dV is unchanged since A_endo = f(T) only)
+    #   - Increases effective C_v at high T via A_TT term
+    #   - Saturates to a fixed "latent heat sink" at T >> T0
+    #
+    # Parameters:
+    #   T0_endo  : Center temperature for endotherm activation (~5000 K)
+    #   w_endo   : Transition width (~1000 K)
+    #   u_inf_endo: High-T saturation energy sink (~2-3 MJ/kg)
+    # =========================================================================
+    T0_endo = 5000.0       # K, endotherm activation center
+    w_endo = 1000.0        # K, transition width
+    u_inf_endo = 4.0e6     # J/kg, saturation energy (tunable)
+    
+    # Compute mass (kg) from moles and mw_avg (g/mol)
+    m_kg = jnp.sum(n) * mw_avg / 1000.0  # total mass in kg
+    m_kg = jnp.maximum(m_kg, 1e-10)  # prevent division by zero
+    
+    # E_scale chosen so that: u_inf ≈ E_scale * T0 / w
+    E_scale = u_inf_endo * (w_endo / T0_endo)  # J/kg
+    
+    # -------------------------------------------------------------------------
+    # Domain Stability Notice (Expert Feedback 4.3):
+    # This EOS is calibrated for T >= 2000K. Below this, non-ideal terms
+    # may lead to C_v < 0 (thermodynamic instability).
+    # -------------------------------------------------------------------------
+    
+    # Reference State Anchoring (Expert Recommendation 4.2.1)
+    # Ensure endotherm term is exactly zero at T_ref = 298.15 K
+    T_ref = 298.15
+    x_endo = (T - T0_endo) / w_endo
+    x_ref = (T_ref - T0_endo) / w_endo
+    
+    # Subtract reference value: A_endo(T_ref) = 0
+    sp_T = jax.nn.softplus(x_endo)
+    sp_ref = jax.nn.softplus(x_ref)  # This is a constant (~0.0067)
+    A_endotherm = -m_kg * E_scale * (sp_T - sp_ref)
+    
+    A_val = A_val + A_endotherm
+    
     # Debug trace
     # jax.debug.print("n_gas_total: {ngt}", ngt=n_gas_total)
     # jax.debug.print("V_gas_eff: {vge}", vge=V_gas_eff)
@@ -261,7 +305,6 @@ def compute_total_helmholtz_energy(
     #                ai=A_gas_ideal, ah=A_excess_hs, ua=U_attr, ase=A_solid_eq, asf=A_solid_fixed)
     # jax.debug.print("Diag: eta={e:.4f}, P_est={p:.1f} GPa", e=eta_raw, p=P_proxy/1e9)
 
-    return A_val
     return A_val
 
 # Hoisted Differentiation: Define core gradient functions once at top level
